@@ -1,0 +1,10 @@
+Flask
+Flask-Limiter
+requests
+python-dotenv
+Flask-CORS
+firebase-admin
+Flask-JWT-Extended
+cryptography
+argon2-cffi
+email-validator
