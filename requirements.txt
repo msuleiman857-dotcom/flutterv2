@@ -8,3 +8,4 @@ Flask-JWT-Extended
 cryptography
 argon2-cffi
 email-validator
+gunicorn
