@@ -53,6 +53,7 @@ app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=7)
 jwt = JWTManager(app)
 active_users = {}
+premium_cache = {}
 
 limiter = Limiter(
     get_remote_address,
