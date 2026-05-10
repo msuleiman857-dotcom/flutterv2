@@ -17,7 +17,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from cryptography.fernet import Fernet
-import uuid
+import uuid    
 from security import (
     hash_password, is_valid_email_format, is_valid_username,
     verify_bot_token, generate_pow_challenge, verify_pow, is_suspicious_request,
@@ -43,6 +43,7 @@ app.config['SECRET_KEY'] = FLASK_SECRET_KEY
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=7)
 jwt = JWTManager(app)
+active_users = {}
 
 limiter = Limiter(
     get_remote_address,
