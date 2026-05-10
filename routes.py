@@ -2,7 +2,7 @@ import os
 os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
 
 import eventlet
-eventlet.monkey_patch(dns=False)
+eventlet.monkey_patch()
 
 from flask import Flask, request, jsonify
 from database_connector import generate_reset_code
