@@ -1,4 +1,4 @@
-Flask
+Flask==3.0.0
 Flask-Limiter
 requests
 python-dotenv
@@ -8,6 +8,7 @@ Flask-JWT-Extended
 cryptography
 argon2-cffi
 email-validator
-gunicorn
-Flask-SocketIO
-eventlet==0.35.2
+Flask-SocketIO==5.3.6
+eventlet==0.33.3
+gunicorn==21.2.0
+setuptools
