@@ -537,6 +537,13 @@ def api_set_typing():
 
         # 201 Created, 200 OK, or 204 No Content all mean success
         if response.status_code in (200, 201, 204):
+            receiver_id_str = str(receiver_id)
+            if receiver_id_str in active_users:
+                receiver_sid = active_users[receiver_id_str]
+                socketio.emit('typing', {
+                    'sender_id': sender_id,
+                    'is_typing': is_typing
+                }, to=receiver_sid)
             return jsonify({"status": "success"}), 200
         else:
             logging.error(f"Supabase set typing error: {response.text}")
