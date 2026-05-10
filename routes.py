@@ -32,6 +32,13 @@ FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "flutterv2", "firebase", "firebase-key.json")
+if not firebase_admin._apps:
+    try:
+        cred = credentials.Certificate(FIREBASE_KEY_PATH)
+        firebase_admin.initialize_app(cred)
+        print("🔥 Firebase initialized successfully!")
+    except Exception as e:
+        print(f"⚠️ Firebase initialization failed: {e}")
 
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
