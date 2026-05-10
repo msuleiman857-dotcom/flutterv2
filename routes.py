@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, request, jsonify
 from database_connector import generate_reset_code
 from flask_limiter import Limiter
@@ -20,13 +23,14 @@ from security import (
     verify_bot_token, generate_pow_challenge, verify_pow, is_suspicious_request,
     dummy_verify, verify_password
 )
-import eventlet
-eventlet.monkey_patch()
 
 load_dotenv(os.path.expanduser("~/flas/.env"))
 
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
-FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "flutterv2", "firebase", "firebase-key.json")
+
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
 fernet = Fernet(ENCRYPTION_KEY)
