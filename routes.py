@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from database_connector import generate_reset_code
 from flask_limiter import Limiter
+from flask_socketio import SocketIO
 from flask_limiter.util import get_remote_address
 import logging
 import os
@@ -19,18 +20,21 @@ from security import (
     verify_bot_token, generate_pow_challenge, verify_pow, is_suspicious_request,
     dummy_verify, verify_password
 )
+import eventlet
+eventlet.monkey_patch()
 
 load_dotenv(os.path.expanduser("~/flas/.env"))
 
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "firebase", "firebase-key.json")
+FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
 fernet = Fernet(ENCRYPTION_KEY)
 
 app = Flask(__name__)
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
 app.config['SECRET_KEY'] = FLASK_SECRET_KEY
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=7)
@@ -53,6 +57,22 @@ try:
         print("⚠️ Firebase init failed: Path not found or not set in .env")
 except Exception as e:
     print(f"⚠️ Firebase init failed (Check your JSON file): {e}")
+
+@socketio.on('connect')
+def handle_connect():
+    # Grab the user_id from the Flutter connection request
+    user_id = request.args.get('user_id')
+    if user_id:
+        active_users[user_id] = request.sid
+        print(f"User {user_id} connected! Active users: {len(active_users)}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    for uid, sid in list(active_users.items()):
+        if sid == request.sid:
+            del active_users[uid]
+            print(f"User {uid} disconnected.")
+            break
 
 @app.route('/api/update-token', methods=['POST'])
 @jwt_required()
@@ -105,9 +125,9 @@ def api_login():
     client_ip = request.remote_addr
 
     # 1. ANOMALY DETECTION (Block direct IP access & malicious scripts)
-    if is_suspicious_request(request):
+    '''if is_suspicious_request(request):
         logging.warning(f"Suspicious login dropped from IP: {client_ip}")
-        return jsonify({"status": "error", "message": "Not found"}), 404
+        return jsonify({"status": "error", "message": "Not found"}), 404'''
 
     try:
         data = request.get_json(silent=True)
@@ -208,9 +228,9 @@ def api_register():
     client_ip = request.remote_addr
 
     # 1. ANOMALY DETECTION
-    if is_suspicious_request(request):
+    '''if is_suspicious_request(request):
         logging.warning(f"Suspicious request dropped from IP: {client_ip}")
-        return jsonify({"status": "error", "message": "Not found"}), 404
+        return jsonify({"status": "error", "message": "Not found"}), 404'''
 
     try:
         data = request.get_json(silent=True)
@@ -582,8 +602,35 @@ def api_send_message():
         sender_name = db_data.get('sender_name', 'Someone')
         target_token = db_data.get('fcm_token')
 
-        # 🚀 Notifications
-        if target_token:
+        # 🚀 Notifications & Real-Time Delivery (The WebSocket Upgrade)
+        receiver_id_str = str(receiver_id)
+
+        if receiver_id_str in active_users:
+            # 1. USER IS ONLINE: Send instantly via WebSocket
+            try:
+                receiver_sid = active_users[receiver_id_str]
+                socket_payload = {
+                    "sender_id": str(sender_id),
+                    "sender_name": sender_name,
+                    "message": message_content,
+                    "media_content": media_content,
+                    "reply_to_msg_id": reply_to_msg_id,
+                    "is_stealth": is_stealth
+                }
+                # Emit the event specifically to the receiver's session
+                socketio.emit('receive_message', socket_payload, to=receiver_sid)
+
+                # Also tell the sender to update their UI
+                sender_sid = active_users.get(str(sender_id))
+                if sender_sid:
+                    socketio.emit('message_sent_success', socket_payload, to=sender_sid)
+
+                print(f"Message delivered via WebSocket to {receiver_id}")
+            except Exception as e:
+                logging.error(f"WebSocket delivery failed: {e}")
+
+        elif target_token:
+            # 2. USER IS OFFLINE: Send a Firebase Push Notification
             try:
                 if is_stealth:
                     display_body = "🕶️ Ultra Stealth Message received"
