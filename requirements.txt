@@ -10,4 +10,4 @@ argon2-cffi
 email-validator
 gunicorn
 Flask-SocketIO
-eventlet
+eventlet==0.35.2
