@@ -539,7 +539,7 @@ def api_set_typing():
             }
             response = requests.delete(url, headers=headers, params=params)
 
-        # If Supabase update was successful, ping the other user via WebSockets!
+        # If database update was successful, ping the WebSockets!
         if response.status_code in (200, 201, 204):
             receiver_id_str = str(receiver_id)
             
@@ -548,7 +548,7 @@ def api_set_typing():
                 
                 global premium_cache
                 
-                # ✨ THE CACHE: Only ask Supabase if we don't already know! ✨
+                # ✨ X-RAY VISION: Check if the RECEIVER is premium
                 if receiver_id_str not in premium_cache:
                     user_url = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
                     user_params = {"id": f"eq.{receiver_id}", "select": "is_premium"}
@@ -567,7 +567,7 @@ def api_set_typing():
                         else:
                             premium_cache[receiver_id_str] = False
                     else:
-                        logging.error(f"Failed to fetch premium status: {user_resp.text}")
+                        logging.error(f"Render Log - Failed to fetch premium status: {user_resp.text}")
                         premium_cache[receiver_id_str] = False
 
                 # Grab the status instantly from the server's memory
@@ -585,11 +585,11 @@ def api_set_typing():
                 
             return jsonify({"status": "success"}), 200
         else:
-            logging.error(f"Supabase set typing error: {response.text}")
+            logging.error(f"Render Log - Supabase typing error: {response.text}")
             return jsonify({"status": "error", "message": "Database action failed"}), 500
 
     except Exception as e:
-        logging.error(f"Set typing error: {e}")
+        logging.error(f"Render Log - Set typing error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
         
 @app.route("/api/send_message", methods=["POST"])
