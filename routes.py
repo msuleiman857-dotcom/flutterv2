@@ -1,5 +1,8 @@
+import os
+os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
+
 import eventlet
-eventlet.monkey_patch()
+eventlet.monkey_patch(dns=False)
 
 from flask import Flask, request, jsonify
 from database_connector import generate_reset_code
@@ -7,7 +10,6 @@ from flask_limiter import Limiter
 from flask_socketio import SocketIO
 from flask_limiter.util import get_remote_address
 import logging
-import os
 import requests
 from dotenv import load_dotenv
 from email_security import send_reset_email
