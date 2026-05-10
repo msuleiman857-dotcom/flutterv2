@@ -498,7 +498,6 @@ def api_set_typing():
 
     sender_id = data.get("sender_id")
     receiver_id = data.get("receiver_id")
-    # Coerce to a strict boolean just in case frontend sends 'true' as string
     raw_is_typing = data.get("is_typing", False)
     is_typing = True if str(raw_is_typing).lower() in ['true', '1'] else False
     typing_text = data.get("typing_text", "")
@@ -518,7 +517,7 @@ def api_set_typing():
         }
 
         if is_typing:
-            # ✨ USER IS TYPING: UPSERT the row (Merge duplicates) ✨
+            # ✨ USER IS TYPING: UPSERT the row
             headers["Prefer"] = "resolution=merge-duplicates"
             payload = {
                 "sender_id": sender_id,
@@ -527,33 +526,51 @@ def api_set_typing():
                 "typing_text": str(typing_text),
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }
-
-            # ✨ THE FIX: Tell Supabase exactly which columns to check for the duplicate
             params = {
-                "on_conflict": "sender_id,receiver_id"
+                "on_conflict": "sender_id,receiver_id" # The fix for duplicates!
             }
-
-            # Notice we added params=params to this line!
             response = requests.post(url, headers=headers, params=params, json=payload)
-
         else:
-            # ✨ USER STOPPED TYPING: Delete the row entirely! ✨
-            # We don't want dead rows taking up your Supabase limits
+            # ✨ USER STOPPED TYPING: Delete the row
             params = {
                 "sender_id": f"eq.{sender_id}",
                 "receiver_id": f"eq.{receiver_id}"
             }
             response = requests.delete(url, headers=headers, params=params)
 
-        # 201 Created, 200 OK, or 204 No Content all mean success
+        # If Supabase update was successful, ping the other user via WebSockets!
         if response.status_code in (200, 201, 204):
             receiver_id_str = str(receiver_id)
             if receiver_id_str in active_users:
                 receiver_sid = active_users[receiver_id_str]
+                
+                # ✨ YOUR PREVIOUS LOGIC: Check if receiver is premium ✨
+                receiver_is_premium = False
+                user_url = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
+                user_params = {"id": f"eq.{receiver_id}", "select": "is_premium"}
+                
+                # Note: We remove the 'Prefer' header here so it's a clean GET request
+                get_headers = {
+                    "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+                    "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+                }
+                user_resp = requests.get(user_url, headers=get_headers, params=user_params)
+                
+                if user_resp.status_code == 200:
+                    user_data = user_resp.json()
+                    if user_data and len(user_data) > 0:
+                        receiver_is_premium = bool(user_data[0].get('is_premium', False))
+                
+                # ✨ THE BOUNCER: If premium, reveal text. If normal, hide it!
+                emitted_text = typing_text if receiver_is_premium else ""
+                
+                # Push the live update to their Flutter app instantly!
                 socketio.emit('typing', {
                     'sender_id': sender_id,
-                    'is_typing': is_typing
+                    'is_typing': is_typing,
+                    'typing_text': emitted_text
                 }, to=receiver_sid)
+                
             return jsonify({"status": "success"}), 200
         else:
             logging.error(f"Supabase set typing error: {response.text}")
@@ -562,7 +579,6 @@ def api_set_typing():
     except Exception as e:
         logging.error(f"Set typing error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
-
 
 @app.route("/api/send_message", methods=["POST"])
 @jwt_required()
