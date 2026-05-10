@@ -525,7 +525,7 @@ def api_set_typing():
                 "receiver_id": receiver_id,
                 "is_typing": True,
                 "typing_text": str(typing_text),
-                "updated_at": datetime.now(timezone.utc).isoformat()
+                "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             }
             params = {
                 "on_conflict": "sender_id,receiver_id"
