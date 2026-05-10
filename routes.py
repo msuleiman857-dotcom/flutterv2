@@ -528,7 +528,7 @@ def api_set_typing():
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }
             params = {
-                "on_conflict": "sender_id,receiver_id" # The fix for duplicates!
+                "on_conflict": "sender_id,receiver_id"
             }
             response = requests.post(url, headers=headers, params=params, json=payload)
         else:
@@ -542,25 +542,36 @@ def api_set_typing():
         # If Supabase update was successful, ping the other user via WebSockets!
         if response.status_code in (200, 201, 204):
             receiver_id_str = str(receiver_id)
+            
             if receiver_id_str in active_users:
                 receiver_sid = active_users[receiver_id_str]
                 
-                # ✨ YOUR PREVIOUS LOGIC: Check if receiver is premium ✨
-                receiver_is_premium = False
-                user_url = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
-                user_params = {"id": f"eq.{receiver_id}", "select": "is_premium"}
+                global premium_cache
                 
-                # Note: We remove the 'Prefer' header here so it's a clean GET request
-                get_headers = {
-                    "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-                    "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
-                }
-                user_resp = requests.get(user_url, headers=get_headers, params=user_params)
-                
-                if user_resp.status_code == 200:
-                    user_data = user_resp.json()
-                    if user_data and len(user_data) > 0:
-                        receiver_is_premium = bool(user_data[0].get('is_premium', False))
+                # ✨ THE CACHE: Only ask Supabase if we don't already know! ✨
+                if receiver_id_str not in premium_cache:
+                    user_url = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
+                    user_params = {"id": f"eq.{receiver_id}", "select": "is_premium"}
+                    
+                    get_headers = {
+                        "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+                        "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+                    }
+                    user_resp = requests.get(user_url, headers=get_headers, params=user_params)
+                    
+                    if user_resp.status_code == 200:
+                        user_data = user_resp.json()
+                        if user_data and len(user_data) > 0:
+                            # Save it to the server's memory!
+                            premium_cache[receiver_id_str] = bool(user_data[0].get('is_premium', False))
+                        else:
+                            premium_cache[receiver_id_str] = False
+                    else:
+                        logging.error(f"Failed to fetch premium status: {user_resp.text}")
+                        premium_cache[receiver_id_str] = False
+
+                # Grab the status instantly from the server's memory
+                receiver_is_premium = premium_cache.get(receiver_id_str, False)
                 
                 # ✨ THE BOUNCER: If premium, reveal text. If normal, hide it!
                 emitted_text = typing_text if receiver_is_premium else ""
@@ -580,7 +591,7 @@ def api_set_typing():
     except Exception as e:
         logging.error(f"Set typing error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
-
+        
 @app.route("/api/send_message", methods=["POST"])
 @jwt_required()
 def api_send_message():
