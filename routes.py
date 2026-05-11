@@ -651,6 +651,7 @@ def api_send_message():
     receiver_id = data.get("receiver_id")
     message_content = str(data.get("message") or data.get("message_content", "")).strip()
     reply_to_msg_id = data.get("reply_to_msg_id")
+    message_id = None
     # This captures media if present, or sends None to keep the DB happy
     media_content = data.get("media_content") or data.get("media_url")
 
