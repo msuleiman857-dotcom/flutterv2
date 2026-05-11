@@ -758,7 +758,8 @@ def api_send_message():
         return jsonify({
             "status": "success",
             "message": "Message sent",
-            "is_stealth": is_stealth
+            "is_stealth": is_stealth,
+            "message_id": message_id  
         }), 201
 
     except Exception as e:
