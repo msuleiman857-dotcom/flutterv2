@@ -88,6 +88,44 @@ def handle_disconnect():
             del active_users[uid]
             print(f"User {uid} disconnected.")
             break
+        
+@socketio.on('mark_as_read')
+def handle_mark_as_read(data):
+    """
+    Triggers when a receiver sees a message. 
+    Updates DB and tells the sender to turn their checkmark blue.
+    """
+    message_id = data.get('message_id')
+    sender_id = data.get('sender_id')  # The person who originally sent the message
+
+    if not message_id or not sender_id:
+        return
+
+    try:
+        # 1. Update Supabase so the change is permanent
+        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/messages"
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+        }
+        params = {"id": f"eq.{message_id}"}
+        payload = {"is_read": True}
+        
+        # Sync update to database
+        requests.patch(url, headers=headers, params=params, json=payload)
+
+        # 2. Real-time "Tap on the shoulder" for the Sender
+        # If the sender is currently online, tell their app to update the UI instantly
+        if str(sender_id) in active_users:
+            sender_sid = active_users[str(sender_id)]
+            socketio.emit('message_read_update', {
+                'message_id': message_id
+            }, room=sender_sid)
+            
+    except Exception as e:
+        logging.error(f"Error in mark_as_read relay: {e}")
 
 @app.route('/api/update-token', methods=['POST'])
 @jwt_required()
@@ -1388,6 +1426,5 @@ def check_premium_status(user_id):
     except Exception as e:
         logging.error(f"Check premium error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
-
 
 
