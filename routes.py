@@ -651,8 +651,6 @@ def api_send_message():
     receiver_id = data.get("receiver_id")
     message_content = str(data.get("message") or data.get("message_content", "")).strip()
     reply_to_msg_id = data.get("reply_to_msg_id")
-    message_id = None
-    # This captures media if present, or sends None to keep the DB happy
     media_content = data.get("media_content") or data.get("media_url")
 
     if str(sender_id) != str(get_jwt_identity()):
@@ -674,8 +672,8 @@ def api_send_message():
     if message_content and fernet:
         encrypted_content = fernet.encrypt(message_content.encode()).decode()
 
+    # ---- Insert the message via RPC ----
     try:
-        # ✨ HTTPS FIREWALL BYPASS: Call the Send Mega-Function ✨
         url = f"{os.getenv('SUPABASE_URL')}/rest/v1/rpc/send_message_and_get_meta"
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
@@ -697,20 +695,42 @@ def api_send_message():
             logging.error(f"Supabase Send RPC error: {response.text}")
             return jsonify({"status": "error", "message": "Failed to save message"}), 500
 
-        # Parse the return data from Supabase
         db_data = response.json()
         is_stealth = db_data.get('is_stealth', False)
         sender_name = db_data.get('sender_name', 'Someone')
         target_token = db_data.get('fcm_token')
 
-        # 🚀 Notifications & Real-Time Delivery (The WebSocket Upgrade)
+        # ---- 🔍 Fetch the real message ID (the one just inserted) ----
+        message_id = None
+        try:
+            url_msg = f"{os.getenv('SUPABASE_URL')}/rest/v1/messages"
+            headers_msg = {
+                "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+                "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+            }
+            params_msg = {
+                "sender_id": f"eq.{sender_id}",
+                "receiver_id": f"eq.{receiver_id}",
+                "order": "sent_at.desc",
+                "limit": "1",
+                "select": "id"
+            }
+            msg_res = requests.get(url_msg, headers=headers_msg, params=params_msg)
+            if msg_res.status_code == 200:
+                msg_data = msg_res.json()
+                if msg_data and len(msg_data) > 0:
+                    message_id = msg_data[0].get('id')
+        except Exception as e:
+            logging.error(f"Failed to fetch new message ID: {e}")
+
+        # ---- WebSocket delivery (if receiver is online) ----
         receiver_id_str = str(receiver_id)
 
         if receiver_id_str in active_users:
-            # 1. USER IS ONLINE: Send instantly via WebSocket
             try:
                 receiver_sid = active_users[receiver_id_str]
                 socket_payload = {
+                    "id": message_id,                     # ✅ Added real ID
                     "sender_id": str(sender_id),
                     "sender_name": sender_name,
                     "message": message_content,
@@ -718,20 +738,21 @@ def api_send_message():
                     "reply_to_msg_id": reply_to_msg_id,
                     "is_stealth": is_stealth
                 }
-                # Emit the event specifically to the receiver's session
                 socketio.emit('receive_message', socket_payload, to=receiver_sid)
 
-                # Also tell the sender to update their UI
+                # Also notify the sender with the same payload (or just the ID)
                 sender_sid = active_users.get(str(sender_id))
                 if sender_sid:
-                    socketio.emit('message_sent_success', socket_payload, to=sender_sid)
+                    socketio.emit('message_sent_success', {
+                        "id": message_id                 # Sender only needs the ID
+                    }, to=sender_sid)
 
                 print(f"Message delivered via WebSocket to {receiver_id}")
             except Exception as e:
                 logging.error(f"WebSocket delivery failed: {e}")
 
         elif target_token:
-            # 2. USER IS OFFLINE: Send a Firebase Push Notification
+            # Offline: Firebase push
             try:
                 if is_stealth:
                     display_body = "🕶️ Ultra Stealth Message received"
@@ -756,17 +777,17 @@ def api_send_message():
             except Exception as e:
                 logging.error(f"Firebase error: {e}")
 
+        # ---- Final HTTP response with the real ID ----
         return jsonify({
             "status": "success",
             "message": "Message sent",
             "is_stealth": is_stealth,
-            "message_id": message_id  
+            "message_id": message_id        # Now it's the real ID
         }), 201
 
     except Exception as e:
         logging.error(f"Send message error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
-
 
 @app.route("/api/messages/<int:message_id>", methods=["DELETE"])
 @jwt_required()
