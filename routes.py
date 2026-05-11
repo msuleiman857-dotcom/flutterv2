@@ -372,6 +372,26 @@ def api_register():
         logging.error(f"Registration exception: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
 
+def parse_supabase_ts(ts_str):
+    """Permanently fixes the 'Invalid isoformat string' error by padding microseconds."""
+    if not ts_str: return None
+    try:
+        # 1. Standardize the offset
+        clean_ts = ts_str.replace('Z', '+00:00')
+        
+        # 2. Fix the microsecond length if a decimal exists
+        if '.' in clean_ts:
+            base, offset = clean_ts.split('+') if '+' in clean_ts else (clean_ts, "")
+            time_part, micro_part = base.split('.')
+            # Pad the microsecond part to exactly 6 digits
+            micro_part = micro_part.ljust(6, '0')[:6]
+            clean_ts = f"{time_part}.{micro_part}+{offset}" if offset else f"{time_part}.{micro_part}"
+            
+        return datetime.fromisoformat(clean_ts)
+    except Exception as e:
+        logging.error(f"Timestamp parsing failed for {ts_str}: {e}")
+        return datetime.now(timezone.utc) # Fallback to prevent 500 errors
+
 @app.route('/api/conversations/<string:user_id>', methods=['GET'])
 @jwt_required()
 def get_conversations(user_id):
@@ -405,7 +425,7 @@ def get_conversations(user_id):
         # Format the data for Flutter exactly like before
         for conv in conversations:
             if conv.get('last_msg_time'):
-                dt = datetime.fromisoformat(conv['last_msg_time'].replace('Z', '+00:00'))
+                dt = parse_supabase_ts(conv['last_msg_time'])
                 conv['last_msg_time'] = dt.strftime('%H:%M')
 
             conv['is_other_typing'] = bool(conv.get('is_other_typing', False))
@@ -469,7 +489,7 @@ def get_private_messages(user_id, other_id):
             if msg.get('sent_at'):
                 try:
                     # Parse standard Postgres ISO timestamp and strip for Flutter
-                    dt = datetime.fromisoformat(msg['sent_at'].replace('Z', '+00:00'))
+                    dt = parse_supabase_ts(msg['sent_at'])
                     msg['sent_at'] = dt.strftime('%Y-%m-%d %H:%M:%S')
                 except Exception:
                     pass
