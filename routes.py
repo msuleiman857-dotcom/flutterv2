@@ -127,6 +127,53 @@ def handle_mark_as_read(data):
     except Exception as e:
         logging.error(f"Error in mark_as_read relay: {e}")
 
+@socketio.on('typing')
+def handle_typing(data):
+    """
+    Handles typing status via WebSockets.
+    This replaces the /api/set_typing HTTP route and stops the logs.
+    """
+    sender_id = str(data.get('sender_id'))
+    receiver_id = str(data.get('receiver_id'))
+    is_typing = data.get('is_typing', False)
+    typing_text = data.get('typing_text', "")
+
+    # 1. Update the database (Supabase) via HTTPS Bypass
+    try:
+        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/typing_status"
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+            "Content-Type": "application/json"
+        }
+
+        if is_typing:
+            # UPSERT: Insert or update if exists
+            headers["Prefer"] = "resolution=merge-duplicates"
+            payload = {
+                "sender_id": sender_id,
+                "receiver_id": receiver_id,
+                "is_typing": True,
+                "typing_text": str(typing_text),
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            requests.post(url, headers=headers, json=payload)
+        else:
+            # DELETE: Remove the typing indicator
+            params = {"sender_id": f"eq.{sender_id}", "receiver_id": f"eq.{receiver_id}"}
+            requests.delete(url, headers=headers, params=params)
+
+        # 2. Real-time Relay: Tell the receiver instantly
+        if receiver_id in active_users:
+            socketio.emit('typing', {
+                'sender_id': sender_id,
+                'is_typing': is_typing,
+                'typing_text': typing_text
+            }, room=active_users[receiver_id])
+
+    except Exception as e:
+        logging.error(f"Error in socket typing relay: {e}")
+
 @app.route('/api/update-token', methods=['POST'])
 @jwt_required()
 def api_update_token():
@@ -548,25 +595,18 @@ def is_premium_user(conn, user_id):
         logging.error(f"Premium check error: {e}")
         return False
 
-@app.route("/api/set_typing", methods=["POST"])
-@jwt_required()
-def api_set_typing():
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"status": "error", "message": "Invalid request"}), 400
+@socketio.on('typing')
+def handle_typing(data):
+    """
+    Handles typing status via WebSockets.
+    This replaces the /api/set_typing HTTP route and stops the logs.
+    """
+    sender_id = str(data.get('sender_id'))
+    receiver_id = str(data.get('receiver_id'))
+    is_typing = data.get('is_typing', False)
+    typing_text = data.get('typing_text', "")
 
-    sender_id = data.get("sender_id")
-    receiver_id = data.get("receiver_id")
-    raw_is_typing = data.get("is_typing", False)
-    is_typing = True if str(raw_is_typing).lower() in ['true', '1'] else False
-    typing_text = data.get("typing_text", "")
-
-    if str(sender_id) != get_jwt_identity():
-        return jsonify({"status": "error", "message": "Unauthorized action"}), 403
-
-    if not sender_id or not receiver_id:
-        return jsonify({"status": "error", "message": "Missing IDs"}), 400
-
+    # 1. Update the database (Supabase) via HTTPS Bypass
     try:
         url = f"{os.getenv('SUPABASE_URL')}/rest/v1/typing_status"
         headers = {
@@ -576,79 +616,31 @@ def api_set_typing():
         }
 
         if is_typing:
-            # ✨ USER IS TYPING: UPSERT the row
+            # UPSERT: Insert or update if exists
             headers["Prefer"] = "resolution=merge-duplicates"
             payload = {
                 "sender_id": sender_id,
                 "receiver_id": receiver_id,
                 "is_typing": True,
                 "typing_text": str(typing_text),
-                "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }
-            params = {
-                "on_conflict": "sender_id,receiver_id"
-            }
-            response = requests.post(url, headers=headers, params=params, json=payload)
+            requests.post(url, headers=headers, json=payload)
         else:
-            # ✨ USER STOPPED TYPING: Delete the row
-            params = {
-                "sender_id": f"eq.{sender_id}",
-                "receiver_id": f"eq.{receiver_id}"
-            }
-            response = requests.delete(url, headers=headers, params=params)
+            # DELETE: Remove the typing indicator
+            params = {"sender_id": f"eq.{sender_id}", "receiver_id": f"eq.{receiver_id}"}
+            requests.delete(url, headers=headers, params=params)
 
-        # If database update was successful, ping the WebSockets!
-        if response.status_code in (200, 201, 204):
-            receiver_id_str = str(receiver_id)
-            
-            if receiver_id_str in active_users:
-                receiver_sid = active_users[receiver_id_str]
-                
-                global premium_cache
-                
-                # ✨ X-RAY VISION: Check if the RECEIVER is premium
-                if receiver_id_str not in premium_cache:
-                    user_url = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
-                    user_params = {"id": f"eq.{receiver_id}", "select": "is_premium"}
-                    
-                    get_headers = {
-                        "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-                        "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
-                    }
-                    user_resp = requests.get(user_url, headers=get_headers, params=user_params)
-                    
-                    if user_resp.status_code == 200:
-                        user_data = user_resp.json()
-                        if user_data and len(user_data) > 0:
-                            # Save it to the server's memory!
-                            premium_cache[receiver_id_str] = bool(user_data[0].get('is_premium', False))
-                        else:
-                            premium_cache[receiver_id_str] = False
-                    else:
-                        logging.error(f"Render Log - Failed to fetch premium status: {user_resp.text}")
-                        premium_cache[receiver_id_str] = False
-
-                # Grab the status instantly from the server's memory
-                receiver_is_premium = premium_cache.get(receiver_id_str, False)
-                
-                # ✨ THE BOUNCER: If premium, reveal text. If normal, hide it!
-                emitted_text = typing_text if receiver_is_premium else ""
-                
-                # Push the live update to their Flutter app instantly!
-                socketio.emit('typing', {
-                    'sender_id': sender_id,
-                    'is_typing': is_typing,
-                    'typing_text': emitted_text
-                }, to=receiver_sid)
-                
-            return jsonify({"status": "success"}), 200
-        else:
-            logging.error(f"Render Log - Supabase typing error: {response.text}")
-            return jsonify({"status": "error", "message": "Database action failed"}), 500
+        # 2. Real-time Relay: Tell the receiver instantly
+        if receiver_id in active_users:
+            socketio.emit('typing', {
+                'sender_id': sender_id,
+                'is_typing': is_typing,
+                'typing_text': typing_text
+            }, room=active_users[receiver_id])
 
     except Exception as e:
-        logging.error(f"Render Log - Set typing error: {e}")
-        return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
+        logging.error(f"Error in socket typing relay: {e}")
         
 @app.route("/api/send_message", methods=["POST"])
 @jwt_required()
@@ -1446,5 +1438,4 @@ def check_premium_status(user_id):
     except Exception as e:
         logging.error(f"Check premium error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
-
 
