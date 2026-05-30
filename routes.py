@@ -350,7 +350,7 @@ def api_register():
     pow_answer = str(data.get("pow_answer", ""))
 
     # 2. PROOF OF WORK VERIFICATION
-   ''' if not verify_pow(pow_challenge_id, pow_answer):
+   '''if not verify_pow(pow_challenge_id, pow_answer):
         logging.warning(f"Failed PoW challenge from IP: {client_ip}")
         return jsonify({"status": "error", "message": "Security verification failed."}), 403
 
