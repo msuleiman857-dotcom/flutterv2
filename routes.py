@@ -244,14 +244,16 @@ def api_login():
     pow_answer = str(data.get("pow_answer", ""))
 
     # 2. PROOF OF WORK & BOT PROTECTION
-    '''if not verify_pow(pow_challenge_id, pow_answer):
+    '''
+    if not verify_pow(pow_challenge_id, pow_answer):
         logging.warning(f"Failed PoW login challenge from IP: {client_ip}")
         return jsonify({"status": "error", "message": "Security verification failed."}), 403
         
     if client_ip not in ['127.0.0.1', '::1']:
         if not verify_bot_token(bot_token, client_ip):
             logging.warning(f"Failed bot login challenge from IP: {client_ip}")
-            return jsonify({"status": "error", "message": "Security verification failed."}), 403 '''
+            return jsonify({"status": "error", "message": "Security verification failed."}), 403 
+    '''
 
     # Input length limits to prevent extreme payload DoS
     if len(identifier) < 3 or not (1 <= len(password) <= 128):
@@ -350,14 +352,16 @@ def api_register():
     pow_answer = str(data.get("pow_answer", ""))
 
     # 2. PROOF OF WORK VERIFICATION
-   '''if not verify_pow(pow_challenge_id, pow_answer):
+   '''
+   if not verify_pow(pow_challenge_id, pow_answer):
         logging.warning(f"Failed PoW challenge from IP: {client_ip}")
         return jsonify({"status": "error", "message": "Security verification failed."}), 403
 
     # 3. BOT PROTECTION
     if not verify_bot_token(bot_token, client_ip):
         logging.warning(f"Failed bot challenge from IP: {client_ip}")
-        return jsonify({"status": "error", "message": "Security verification failed."}), 403'''
+        return jsonify({"status": "error", "message": "Security verification failed."}), 403
+    '''
 
     # 4. ZERO TRUST INPUT VALIDATION
     if not is_valid_username(username) or not is_valid_email_format(email):
