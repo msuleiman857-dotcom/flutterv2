@@ -88,7 +88,9 @@ def send_reset_email(email, reset_code):
         if response.status_code == 201:
             print("✅ Email sent successfully!")
         else:
-            print(f"❌ Failed to send email: {response.status_code} → {response.text}")
+            print(f"❌ Failed to send email: {response.status_code} → {response.text}")    
+    except Exception as e:
+        print(f"⚠️ Error sending email: {e}")
 
 def send_verify_email(email, reset_code):
     headers = {
@@ -166,13 +168,11 @@ def send_verify_email(email, reset_code):
         """
     }
 
-
     try:
         response = requests.post(BREVO_SEND_URL, headers=headers, json=data)
         if response.status_code == 201:
             print("✅ Email sent successfully!")
         else:
             print(f"❌ Failed to send email: {response.status_code} → {response.text}")
-    except Exception as e:
     except Exception as e:
         print(f"⚠️ Error sending email: {e}")
