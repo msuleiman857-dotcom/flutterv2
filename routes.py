@@ -1074,8 +1074,8 @@ def request_password_reset():
 
         # 2. Rate Limit Logic (Max 3 per hour)
         if window_start_str:
-            # Handle PostgreSQL ISO format (sometimes ends in 'Z' instead of offset)
-            clean_window_str = window_start_str.replace("Z", "+00:00")
+            # ✨ THE FIX: Strip off the fractional seconds AND the 'Z' so Python doesn't crash!
+            clean_window_str = str(window_start_str).split('.')[0].replace("Z", "")
             window_time = datetime.fromisoformat(clean_window_str)
 
             # Ensure window_time is timezone-aware
