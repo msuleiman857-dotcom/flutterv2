@@ -12,7 +12,7 @@ from flask_limiter.util import get_remote_address
 import logging
 import requests
 from dotenv import load_dotenv
-from email_security import send_reset_email
+from email_security import send_reset_email, send_verify_email
 from datetime import datetime, timedelta, timezone
 from flask_cors import CORS
 import firebase_admin
@@ -328,11 +328,6 @@ def get_challenge():
 def api_register():
     client_ip = request.remote_addr
 
-    # 1. ANOMALY DETECTION
-    '''if is_suspicious_request(request):
-        logging.warning(f"Suspicious request dropped from IP: {client_ip}")
-        return jsonify({"status": "error", "message": "Not found"}), 404'''
-
     try:
         data = request.get_json(silent=True)
     except Exception:
@@ -341,82 +336,142 @@ def api_register():
     if not data or not isinstance(data, dict):
         return jsonify({"status": "error", "message": "Invalid body"}), 400
 
-    # Extract and normalize all data
     username = str(data.get("username", "")).strip()
-    email = str(data.get("email", "")).strip().lower()  # ← Normalize email
+    email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", ""))
-    bot_token = str(data.get("captcha_token", ""))
-    pow_challenge_id = str(data.get("pow_challenge_id", ""))
-    pow_answer = str(data.get("pow_answer", ""))
 
-    # 2. PROOF OF WORK VERIFICATION
-    # if not verify_pow(pow_challenge_id, pow_answer):
-    #     logging.warning(f"Failed PoW challenge from IP: {client_ip}")
-    #     return jsonify({"status": "error", "message": "Security verification failed."}), 403
-
-    # 3. BOT PROTECTION
-    # if not verify_bot_token(bot_token, client_ip):
-    #     logging.warning(f"Failed bot challenge from IP: {client_ip}")
-    #     return jsonify({"status": "error", "message": "Security verification failed."}), 403
-
-    # 4. ZERO TRUST INPUT VALIDATION
     if not is_valid_username(username) or not is_valid_email_format(email):
         return jsonify({"status": "error", "message": "Invalid registration data."}), 400
 
     if len(password) < 8 or len(password) > 128:
         return jsonify({"status": "error", "message": "Password must be 8-128 characters."}), 400
 
-    # 6. EXPENSIVE CRYPTOGRAPHY
     try:
-        hashed_password = hash_password(password)
-    except Exception as e:
-        logging.error(f"Hashing failure: {e}")
-        return jsonify({"status": "error", "message": "Internal error"}), 500
-
-    # 7. DATABASE INSERTION (HTTPS BYPASS)
-    user_uuid = str(uuid.uuid4())
-
-    try:
-        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
+        # 1. Check if user already exists in the main users table
+        url_users = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
             "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal" # Tells Supabase not to send the whole row back, saves bandwidth
+            "Content-Type": "application/json"
+        }
+        
+        check_user = requests.get(url_users, headers=headers, params={"email": f"eq.{email}"})
+        if check_user.status_code == 200 and len(check_user.json()) > 0:
+            return jsonify({"status": "error", "message": "Account already exists."}), 409
+
+        # 2. Generate OTP and Expiry Time
+        otp_code = generate_reset_code() # Reusing your secure generator
+        
+        # 3. Store OTP in verify_email table (UPSERT to overwrite if they request again)
+        url_verify = f"{os.getenv('SUPABASE_URL')}/rest/v1/verify_email"
+        headers["Prefer"] = "resolution=merge-duplicates" # Overwrite if email exists
+        
+        payload = {
+            "email": email,
+            "verification_code": otp_code,
+            "created_at": datetime.now(timezone.utc).isoformat()
         }
 
-        payload = {
+        response = requests.post(url_verify, headers=headers, json=payload)
+
+        if response.status_code in (200, 201):
+            # 4. Send the email using your existing function
+            send_verify_email(email, otp_code)
+            
+            return jsonify({
+                "status": "success",
+                "message": "OTP sent! Please check your email."
+            }), 200
+        else:
+            logging.error(f"Supabase DB error saving OTP: {response.text}")
+            return jsonify({"status": "error", "message": "Failed to generate OTP."}), 500
+
+    except Exception as e:
+        logging.error(f"Registration exception: {e}")
+        return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
+
+
+@app.route("/api/verify_reg_otp", methods=["POST"])
+@limiter.limit("10 per minute")
+def verify_reg_otp():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email", "").strip().lower()
+    otp_code = data.get("otp_code", "").strip()
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+
+    if not email or not otp_code or not username or not password:
+        return jsonify({"status": "error", "message": "All fields and OTP are required"}), 400
+
+    try:
+        # ✨ HTTPS FIREWALL BYPASS ✨
+        url_verify = f"{os.getenv('SUPABASE_URL')}/rest/v1/verify_email"
+        url_users = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
+        
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+            "Content-Type": "application/json"
+        }
+
+        # 1. Fetch OTP from verify_email table
+        params = {"email": f"eq.{email}", "select": "*"}
+        res = requests.get(url_verify, headers=headers, params=params)
+
+        if res.status_code != 200:
+            return jsonify({"status": "error", "message": "Database error"}), 500
+
+        verify_data = res.json()
+        if not verify_data or len(verify_data) == 0:
+            return jsonify({"status": "error", "message": "Invalid email or OTP expired."}), 400
+
+        row = verify_data[0]
+        db_code = row.get("verification_code")
+        created_at_str = row.get("created_at")
+
+        # 2. Check if code matches
+        if not db_code or db_code != otp_code:
+            return jsonify({"status": "error", "message": "Invalid code."}), 400
+
+        # 3. Check 5-minute expiration
+        if created_at_str:
+            clean_time_str = created_at_str[:19] # Ignore trailing milliseconds
+            created_time = datetime.fromisoformat(clean_time_str).replace(tzinfo=timezone.utc)
+            
+            if datetime.now(timezone.utc) > created_time + timedelta(minutes=5):
+                # Delete expired OTP
+                requests.delete(url_verify, headers=headers, params={"email": f"eq.{email}"})
+                return jsonify({"status": "error", "message": "OTP expired. Please register again."}), 400
+
+        # 4. OTP is valid! Hash password and insert into users table
+        hashed_password = hash_password(password)
+        user_uuid = str(uuid.uuid4())
+
+        user_payload = {
             "id": user_uuid,
             "email": email,
             "username": username,
             "password": hashed_password
-            # created_at and is_premium will be set automatically by our new database defaults!
         }
 
-        response = requests.post(url, headers=headers, json=payload)
+        # Use minimal return to save bandwidth
+        headers["Prefer"] = "return=minimal"
+        insert_res = requests.post(url_users, headers=headers, json=user_payload)
 
-        # 201 Created is the standard Postgres/Supabase response for a successful INSERT
-        if response.status_code in (200, 201):
-            logging.info(f"Account registered. UUID: {user_uuid}")
-            return jsonify({
-                "status": "success",
-                "message": "Account created successfully! Please log in."
-            }), 201
-
-        # PostgREST natively returns 409 Conflict if a UNIQUE constraint (email or username) is violated
-        elif response.status_code == 409 or "duplicate key value" in response.text.lower():
-            logging.info(f"Duplicate registration attempted. IP: {client_ip}")
-            return jsonify({
-                "status": "error",
-                "message": "An account with this username or email already exists."
-            }), 409
-
+        if insert_res.status_code in (200, 201):
+            # 5. Cleanup: Delete the used OTP from verify_email table
+            requests.delete(url_verify, headers=headers, params={"email": f"eq.{email}"})
+            
+            logging.info(f"Account verified and created. UUID: {user_uuid}")
+            return jsonify({"status": "success", "message": "Account verified! You can now log in."}), 201
+            
+        elif insert_res.status_code == 409 or "duplicate key" in insert_res.text.lower():
+            return jsonify({"status": "error", "message": "Username already taken."}), 409
         else:
-            logging.error(f"Supabase DB error during registration: {response.text}")
-            return jsonify({"status": "error", "message": "Registration failed. Please try again."}), 500
+            return jsonify({"status": "error", "message": "Failed to create account."}), 500
 
     except Exception as e:
-        logging.error(f"Registration exception: {e}")
+        logging.error(f"Verify Reg OTP error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
 
 def parse_supabase_ts(ts_str):
