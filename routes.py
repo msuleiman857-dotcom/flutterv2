@@ -347,7 +347,7 @@ def api_register():
         return jsonify({"status": "error", "message": "Password must be 8-128 characters."}), 400
 
     try:
-        # 1. Check if user already exists in the main users table
+        # 1. Check if user already exists (Email OR Username)
         url_users = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
@@ -355,9 +355,23 @@ def api_register():
             "Content-Type": "application/json"
         }
         
-        check_user = requests.get(url_users, headers=headers, params={"email": f"eq.{email}"})
-        if check_user.status_code == 200 and len(check_user.json()) > 0:
-            return jsonify({"status": "error", "message": "Account already exists."}), 409
+        # Supabase 'or' syntax checks both conditions in a single query
+        params = {
+            "or": f"(email.eq.{email},username.eq.{username})",
+            "select": "email,username" 
+        }
+        
+        check_user = requests.get(url_users, headers=headers, params=params)
+        
+        if check_user.status_code == 200:
+            existing_users = check_user.json()
+            if len(existing_users) > 0:
+                # Figure out exactly which field caused the conflict
+                conflict = existing_users[0]
+                if conflict.get('email') == email:
+                    return jsonify({"status": "error", "message": "An account with this email already exists."}), 409
+                else:
+                    return jsonify({"status": "error", "message": "This username is already taken."}), 409
 
         # 2. Generate OTP and Expiry Time
         otp_code = generate_reset_code() # Reusing your secure generator
@@ -389,7 +403,6 @@ def api_register():
     except Exception as e:
         logging.error(f"Registration exception: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
-
 
 @app.route("/api/verify_reg_otp", methods=["POST"])
 @limiter.limit("10 per minute")
