@@ -386,7 +386,8 @@ def api_register():
             "created_at": datetime.now(timezone.utc).isoformat()
         }
 
-        response = requests.post(url_verify, headers=headers, json=payload)
+        params_upsert = {"on_conflict": "email"}
+        response = requests.post(url_verify, headers=headers, json=payload, params=params_upsert)
 
         if response.status_code in (200, 201):
             # 4. Send the email using your existing function
