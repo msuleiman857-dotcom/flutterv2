@@ -59,7 +59,7 @@ def send_reset_email(email, reset_code):
                           <tr>
                             <td align="center" style="background-color: #FFFDFB; padding: 32px; border-radius: 12px; border: 2px solid #F14666;">
                               <span style="display: block; font-size: 12px; font-weight: 600; letter-spacing: 1px; color: #EE8980; margin-bottom: 12px; text-transform: uppercase;">
-                                &#128274; Secure Reset Code
+                                Secure Reset Code
                               </span>
                               <span style="display: inline-block; font-size: 42px; font-weight: 700; letter-spacing: 12px; color: #1A1C20;">
                                 {reset_code}
@@ -150,9 +150,9 @@ def send_verify_email(email, verify_code):
 
                         <table border="0" cellpadding="0" cellspacing="0" width="100%">
                           <tr>
-                            <td align="center" style="background-color: #FEF6F5; padding: 32px; border-radius: 12px; border: 2px dashed #EE8980;">
+                            <td align="center" style="background-color: #FEF6F5; padding: 32px; border-radius: 12px; border: 2px solid #EE8980;">
                               <span style="display: block; font-size: 12px; font-weight: 600; letter-spacing: 1px; color: #EE8980; margin-bottom: 12px; text-transform: uppercase;">
-                                &#128140; Verification Code
+                                Verification Code
                               </span>
                               <span style="display: inline-block; font-size: 42px; font-weight: 700; letter-spacing: 12px; color: #1A1C20;">
                                 {verify_code}
