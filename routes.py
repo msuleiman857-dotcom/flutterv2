@@ -550,7 +550,6 @@ def create_post():
     data = request.get_json(silent=True) or {}
     poster_id = get_jwt_identity()
     
-    # Grab data from Flutter
     video_url = data.get('video_url', '')
     caption = data.get('caption', '')
     target_gender = data.get('target_gender', 'Male')
@@ -565,7 +564,7 @@ def create_post():
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
             "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
             "Content-Type": "application/json",
-            "Prefer": "return=representation" # Return the newly created row
+            "Prefer": "return=representation" 
         }
         
         payload = {
@@ -581,9 +580,21 @@ def create_post():
         if response.status_code in (200, 201):
             new_post = response.json()[0]
             
-            # ✨ REAL-TIME SOCKET EMISSION
-            # Broadcast to ALL connected users so their feed updates instantly
-            socketio.emit('new_post_added', {"post_id": new_post['id']})
+            # --- THE MAGIC TRICK ---
+            # Quickly fetch the user's data so the socket payload is 100% complete
+            user_res = requests.get(
+                f"{os.getenv('SUPABASE_URL')}/rest/v1/users",
+                headers={"apikey": headers["apikey"], "Authorization": headers["Authorization"]},
+                params={"id": f"eq.{poster_id}", "select": "username,profile_pic_url"}
+            )
+            
+            if user_res.status_code == 200 and len(user_res.json()) > 0:
+                new_post['users'] = user_res.json()[0]
+            else:
+                new_post['users'] = {"username": "Unknown", "profile_pic_url": None}
+
+            # ✨ Emit the FULL POST directly to all active apps!
+            socketio.emit('new_post_added', {"post": new_post})
             
             return jsonify({"status": "success", "message": "Post published!", "post": new_post}), 201
         else:
