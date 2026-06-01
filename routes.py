@@ -508,6 +508,65 @@ def parse_supabase_ts(ts_str):
         logging.error(f"Timestamp parsing failed for {ts_str}: {e}")
         return datetime.now(timezone.utc) # Fallback to prevent 500 errors
 
+// ─────────────────────────────────────────────
+  //  POSTS FEED API
+  // ─────────────────────────────────────────────
+  
+  // Fetch all posts
+  static Future<Map<String, dynamic>> fetchPosts() async {
+    try {
+      final token = await SessionManager.getToken();
+      final response = await http.get(
+        Uri.parse('$baseUrl/api/posts'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+      );
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200) {
+        return {'success': true, 'posts': data['posts']};
+      } else {
+        return {'success': false, 'message': data['message'] ?? 'Failed to load posts'};
+      }
+    } catch (e) {
+      return {'success': false, 'message': 'Connection error. Please check your internet.'};
+    }
+  }
+
+  // Create a new post
+  static Future<Map<String, dynamic>> createPost({
+    required String videoUrl,
+    required String caption,
+    required String targetGender,
+    required double priceNaira,
+  }) async {
+    try {
+      final token = await SessionManager.getToken();
+      final response = await http.post(
+        Uri.parse('$baseUrl/api/posts'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+        body: jsonEncode({
+          'video_url': videoUrl,
+          'caption': caption,
+          'target_gender': targetGender,
+          'price_naira': priceNaira,
+        }),
+      );
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        return {'success': true, 'message': data['message']};
+      } else {
+        return {'success': false, 'message': data['message'] ?? 'Failed to publish.'};
+      }
+    } catch (e) {
+      return {'success': false, 'message': 'Connection error.'};
+    }
+  }
+
 @app.route('/api/conversations/<string:user_id>', methods=['GET'])
 @jwt_required()
 def get_conversations(user_id):
