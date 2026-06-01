@@ -508,64 +508,91 @@ def parse_supabase_ts(ts_str):
         logging.error(f"Timestamp parsing failed for {ts_str}: {e}")
         return datetime.now(timezone.utc) # Fallback to prevent 500 errors
 
-// ─────────────────────────────────────────────
-  //  POSTS FEED API
-  // ─────────────────────────────────────────────
-  
-  // Fetch all posts
-  static Future<Map<String, dynamic>> fetchPosts() async {
-    try {
-      final token = await SessionManager.getToken();
-      final response = await http.get(
-        Uri.parse('$baseUrl/api/posts'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $token',
-        },
-      );
-      final data = jsonDecode(response.body);
-      if (response.statusCode == 200) {
-        return {'success': true, 'posts': data['posts']};
-      } else {
-        return {'success': false, 'message': data['message'] ?? 'Failed to load posts'};
-      }
-    } catch (e) {
-      return {'success': false, 'message': 'Connection error. Please check your internet.'};
-    }
-  }
+# ==========================================
+# ✨ PAYME POSTS FEED & WEBSOCKETS
+# ==========================================
 
-  // Create a new post
-  static Future<Map<String, dynamic>> createPost({
-    required String videoUrl,
-    required String caption,
-    required String targetGender,
-    required double priceNaira,
-  }) async {
-    try {
-      final token = await SessionManager.getToken();
-      final response = await http.post(
-        Uri.parse('$baseUrl/api/posts'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $token',
-        },
-        body: jsonEncode({
-          'video_url': videoUrl,
-          'caption': caption,
-          'target_gender': targetGender,
-          'price_naira': priceNaira,
-        }),
-      );
-      final data = jsonDecode(response.body);
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        return {'success': true, 'message': data['message']};
-      } else {
-        return {'success': false, 'message': data['message'] ?? 'Failed to publish.'};
-      }
-    } catch (e) {
-      return {'success': false, 'message': 'Connection error.'};
-    }
-  }
+@app.route('/api/posts', methods=['GET'])
+@jwt_required()
+def get_posts():
+    try:
+        # ✨ HTTPS FIREWALL BYPASS ✨
+        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/posts"
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+        }
+        
+        # We use Supabase relational querying to join the users table
+        # and grab the poster's username in one single query!
+        params = {
+            "select": "id,poster_id,video_url,caption,likes,price_naira,target_gender,created_at,users(username,profile_pic_url)",
+            "order": "created_at.desc",
+            "limit": "50"
+        }
+        
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code == 200:
+            return jsonify({"status": "success", "posts": response.json()}), 200
+        else:
+            logging.error(f"Supabase fetch posts error: {response.text}")
+            return jsonify({"status": "error", "message": "Failed to fetch posts"}), 500
+            
+    except Exception as e:
+        logging.error(f"Get posts error: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+
+@app.route('/api/posts', methods=['POST'])
+@jwt_required()
+def create_post():
+    data = request.get_json(silent=True) or {}
+    poster_id = get_jwt_identity()
+    
+    # Grab data from Flutter
+    video_url = data.get('video_url', '')
+    caption = data.get('caption', '')
+    target_gender = data.get('target_gender', 'Male')
+    price_naira = data.get('price_naira', 0.0)
+
+    if not video_url:
+        return jsonify({"status": "error", "message": "Video/Media URL is required"}), 400
+
+    try:
+        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/posts"
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation" # Return the newly created row
+        }
+        
+        payload = {
+            "poster_id": str(poster_id),
+            "video_url": video_url,
+            "caption": caption,
+            "target_gender": target_gender,
+            "price_naira": price_naira
+        }
+        
+        response = requests.post(url, headers=headers, json=payload)
+        
+        if response.status_code in (200, 201):
+            new_post = response.json()[0]
+            
+            # ✨ REAL-TIME SOCKET EMISSION
+            # Broadcast to ALL connected users so their feed updates instantly
+            socketio.emit('new_post_added', {"post_id": new_post['id']})
+            
+            return jsonify({"status": "success", "message": "Post published!", "post": new_post}), 201
+        else:
+            logging.error(f"Supabase create post error: {response.text}")
+            return jsonify({"status": "error", "message": "Database action failed"}), 500
+
+    except Exception as e:
+        logging.error(f"Create post error: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 @app.route('/api/conversations/<string:user_id>', methods=['GET'])
 @jwt_required()
