@@ -174,6 +174,18 @@ def handle_typing(data):
     except Exception as e:
         logging.error(f"Error in socket typing relay: {e}")
 
+@app.route('/api/webhook/supabase-posts', methods=['POST'])
+def supabase_posts_webhook():
+    data = request.get_json(silent=True) or {}
+    
+    # Check if a new row was inserted into Supabase
+    if data.get('type') == 'INSERT':
+        # Emit the event to all Flutter apps!
+        # Flutter just uses this to run _fetchFeed(), so the payload structure doesn't matter much
+        socketio.emit('new_post_added', {"message": "New post added in Supabase!"})
+        
+    return jsonify({"status": "success"}), 200
+
 @app.route('/api/update-token', methods=['POST'])
 @jwt_required()
 def api_update_token():
