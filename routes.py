@@ -251,7 +251,7 @@ def supabase_likes_webhook():
         
         # Querying the likes table where post_id matches
         response = requests.get(
-            f"{supabase_url}/rest/v1/likes?post_id=eq.{post_id}&select=id",
+            f"{supabase_url}/rest/v1/post_likes?post_id=eq.{post_id}&select=id",
             headers=headers
         )
 
