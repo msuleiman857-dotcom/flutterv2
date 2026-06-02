@@ -268,7 +268,6 @@ def supabase_likes_webhook():
                     'post_id': str(post_id), 
                     'likes': int(total_likes)
                 }, 
-                broadcast=True
             )
 
             return jsonify({"status": "success", "likes": total_likes}), 200
