@@ -525,36 +525,44 @@ def parse_supabase_ts(ts_str):
 # ==========================================
 
 @app.route('/api/posts', methods=['GET'])
-@jwt_required()
+@jwt_required() # Keep this if you only want logged-in users to see the feed
 def get_posts():
     try:
-        # ✨ HTTPS FIREWALL BYPASS ✨
         url = f"{os.getenv('SUPABASE_URL')}/rest/v1/posts"
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
             "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
         }
         
-        # We use Supabase relational querying to join the users table
-        # and grab the poster's username in one single query!
+        # ✨ THE MAGIC FIX: Supabase JOIN in one query!
+        # "*,users(username)" tells Supabase: 
+        # "Get all post data (*), and JOIN the users table to get just the username"
         params = {
-            "select": "id,poster_id,video_url,caption,likes,price_naira,target_gender,created_at,users(username,profile_pic_url)",
-            "order": "created_at.desc",
-            "limit": "50"
+            "select": "*,users(username)", 
+            "order": "created_at.desc",     # Newest posts first
+            "limit": "20"                   # Only grab 20 at a time to keep it lightning fast
         }
-        
+
         response = requests.get(url, headers=headers, params=params)
-        
+
         if response.status_code == 200:
-            return jsonify({"status": "success", "posts": response.json()}), 200
+            posts = response.json()
+            
+            # (Optional) Flatten the data so Flutter reads it easily
+            # Supabase returns users as a nested dictionary: {"users": {"username": "John"}}
+            # Flutter expects it the exact way you wrote it in post_feed.dart, so this is perfect!
+            
+            return jsonify({
+                "success": True, 
+                "posts": posts
+            }), 200
         else:
             logging.error(f"Supabase fetch posts error: {response.text}")
-            return jsonify({"status": "error", "message": "Failed to fetch posts"}), 500
-            
-    except Exception as e:
-        logging.error(f"Get posts error: {e}")
-        return jsonify({"status": "error", "message": "Internal server error"}), 500
+            return jsonify({"success": False, "message": "Failed to load feed"}), 500
 
+    except Exception as e:
+        logging.error(f"Error fetching posts: {str(e)}")
+        return jsonify({"success": False, "message": "Network error"}), 500
 
 @app.route('/api/posts', methods=['POST'])
 @jwt_required()
