@@ -220,57 +220,64 @@ def toggle_post_like(post_id):
 
 @app.route('/api/webhook/supabase-likes', methods=['POST'])
 def supabase_likes_webhook():
-    """
-    Supabase Webhook Receiver: Triggers on ANY change (INSERT/DELETE) in post_likes table.
-    Updates the main posts table cache counter and broadcasts via Socket.IO.
-    """
-    data = request.get_json(silent=True) or {}
-    logging.info(f"Supabase Likes Webhook event received: {data}")
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "error", "message": "No payload received"}), 400
+
+    print("DEBUG: Supabase Webhook payload received:", data)
+
+    # 1. Safe extraction handling both INSERT (likes) and DELETE (unlikes)
+    event_type = data.get('type')  # 'INSERT' or 'DELETE'
     
-    event_type = data.get('type')
-    record = data.get('record')
-    old_record = data.get('old_record')
+    # Python fallback trick to avoid the NoneType explicit null trap
+    record = data.get('record') if data.get('record') is not None else data.get('old_record')
     
-    # Extract post_id safely depending on whether it's an addition or removal
-    post_id = None
-    if event_type in ['INSERT', 'UPDATE'] and record:
-        post_id = record.get('post_id')
-    elif event_type == 'DELETE' and old_record:
-        post_id = old_record.get('post_id')
-        
+    if not record:
+        return jsonify({"status": "error", "message": "No record found in payload"}), 400
+
+    post_id = record.get('post_id')
     if not post_id:
-        return jsonify({"status": "ignored", "message": "No operational post_id found"}), 200
-        
+        return jsonify({"status": "error", "message": "No post_id found in record"}), 400
+
     try:
+        # 2. Fetch the fresh absolute live total from Supabase database
         supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        
         headers = {
-            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
         }
         
-        # 1. Fetch the exact absolute fresh count from the post_likes table
-        count_url = f"{supabase_url}/rest/v1/post_likes"
-        params = {"post_id": f"eq.{post_id}", "select": "id"}
-        count_res = requests.get(count_url, headers=headers, params=params)
-        
-        new_likes_count = 0
-        if count_res.status_code == 200:
-            new_likes_count = len(count_res.json())
+        # Querying the likes table where post_id matches
+        response = requests.get(
+            f"{supabase_url}/rest/v1/likes?post_id=eq.{post_id}&select=id",
+            headers=headers
+        )
+
+        if response.status_code == 200:
+            likes_list = response.json()
+            total_likes = len(likes_list)  # Count up the actual active rows
             
-        # 2. Synchronize the 'likes' column directly on the master posts table
-        post_update_url = f"{supabase_url}/rest/v1/posts"
-        requests.patch(post_update_url, headers=headers, params={"id": f"eq.{post_id}"}, json={"likes": new_likes_count})
-        
-        # 3. Broadcast real-time change to all connected Flutter apps via Socket.IO
-        socketio.emit('post_like_updated', {
-            'post_id': str(post_id),
-            'likes': new_likes_count
-        })
-        
-        return jsonify({"status": "success", "post_id": post_id, "likes": new_likes_count}), 200
-        
+            print(f"DEBUG: Broadcast to App -> Post: {post_id} now has {total_likes} likes")
+
+            # 3. CRITICAL: broadcast=True is mandatory here so every user gets it!
+            socketio.emit(
+                'post_like_updated', 
+                {
+                    'post_id': str(post_id), 
+                    'likes': int(total_likes)
+                }, 
+                broadcast=True
+            )
+
+            return jsonify({"status": "success", "likes": total_likes}), 200
+        else:
+            print(f"ERROR: Supabase returned code {response.status_code}: {response.text}")
+            return jsonify({"status": "error", "message": "Failed to count likes from DB"}), 500
+
     except Exception as e:
-        logging.error(f"Error executing likes webhook: {str(e)}")
+        print(f"CRITICAL WEBHOOK EXCEPTION: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/webhook/supabase-posts', methods=['POST'])
