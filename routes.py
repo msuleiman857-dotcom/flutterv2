@@ -174,6 +174,105 @@ def handle_typing(data):
     except Exception as e:
         logging.error(f"Error in socket typing relay: {e}")
 
+@app.route('/api/posts/<string:post_id>/like', methods=['POST'])
+@jwt_required()
+def toggle_post_like(post_id):
+    """
+    Lightweight route: Simply inserts or deletes rows from post_likes.
+    Does NOT calculate counts or handle Socket.IO broadcasts directly.
+    """
+    current_user_id = get_jwt_identity()
+    supabase_url = os.getenv('SUPABASE_URL')
+    headers = {
+        "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+        "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # Check if this user has already liked this post
+        check_url = f"{supabase_url}/rest/v1/post_likes"
+        params = {
+            "post_id": f"eq.{post_id}",
+            "user_id": f"eq.{current_user_id}"
+        }
+        check_res = requests.get(check_url, headers=headers, params=params)
+        
+        if check_res.status_code != 200:
+            return jsonify({"success": False, "message": "Database lookup error"}), 500
+            
+        existing_likes = check_res.json()
+
+        if len(existing_likes) > 0:
+            # UNLIKE ACTION: Delete the row
+            requests.delete(check_url, headers=headers, params=params)
+            return jsonify({"success": True, "action": "unliked"}), 200
+        else:
+            # LIKE ACTION: Insert a new row
+            like_data = {"post_id": post_id, "user_id": current_user_id}
+            requests.post(check_url, headers=headers, json=like_data)
+            return jsonify({"success": True, "action": "liked"}), 200
+
+    except Exception as e:
+        logging.error(f"Error toggling post like: {str(e)}")
+        return jsonify({"success": False, "message": "Internal server error"}), 500
+
+
+@app.route('/api/webhook/supabase-likes', methods=['POST'])
+def supabase_likes_webhook():
+    """
+    Supabase Webhook Receiver: Triggers on ANY change (INSERT/DELETE) in post_likes table.
+    Updates the main posts table cache counter and broadcasts via Socket.IO.
+    """
+    data = request.get_json(silent=True) or {}
+    logging.info(f"Supabase Likes Webhook event received: {data}")
+    
+    event_type = data.get('type')
+    record = data.get('record')
+    old_record = data.get('old_record')
+    
+    # Extract post_id safely depending on whether it's an addition or removal
+    post_id = None
+    if event_type in ['INSERT', 'UPDATE'] and record:
+        post_id = record.get('post_id')
+    elif event_type == 'DELETE' and old_record:
+        post_id = old_record.get('post_id')
+        
+    if not post_id:
+        return jsonify({"status": "ignored", "message": "No operational post_id found"}), 200
+        
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+        }
+        
+        # 1. Fetch the exact absolute fresh count from the post_likes table
+        count_url = f"{supabase_url}/rest/v1/post_likes"
+        params = {"post_id": f"eq.{post_id}", "select": "id"}
+        count_res = requests.get(count_url, headers=headers, params=params)
+        
+        new_likes_count = 0
+        if count_res.status_code == 200:
+            new_likes_count = len(count_res.json())
+            
+        # 2. Synchronize the 'likes' column directly on the master posts table
+        post_update_url = f"{supabase_url}/rest/v1/posts"
+        requests.patch(post_update_url, headers=headers, params={"id": f"eq.{post_id}"}, json={"likes": new_likes_count})
+        
+        # 3. Broadcast real-time change to all connected Flutter apps via Socket.IO
+        socketio.emit('post_like_updated', {
+            'post_id': str(post_id),
+            'likes': new_likes_count
+        })
+        
+        return jsonify({"status": "success", "post_id": post_id, "likes": new_likes_count}), 200
+        
+    except Exception as e:
+        logging.error(f"Error executing likes webhook: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route('/api/webhook/supabase-posts', methods=['POST'])
 def supabase_posts_webhook():
     data = request.get_json(silent=True) or {}
