@@ -261,13 +261,23 @@ def supabase_likes_webhook():
             
             print(f"DEBUG: Broadcast to App -> Post: {post_id} now has {total_likes} likes")
 
-            # 3. CRITICAL: broadcast=True is mandatory here so every user gets it!
+            # ✨ THE MISSING PIECE: Update the main 'posts' table! ✨
+            post_update_url = f"{supabase_url}/rest/v1/posts"
+            update_res = requests.patch(
+                post_update_url, 
+                headers=headers, 
+                params={"id": f"eq.{post_id}"}, 
+                json={"likes": total_likes}
+            )
+            print(f"DEBUG: Post table update status: {update_res.status_code}")
+
+            # 3. Broadcast real-time change to all connected Flutter apps via Socket.IO
             socketio.emit(
                 'post_like_updated', 
                 {
                     'post_id': str(post_id), 
                     'likes': int(total_likes)
-                }, 
+                }
             )
 
             return jsonify({"status": "success", "likes": total_likes}), 200
