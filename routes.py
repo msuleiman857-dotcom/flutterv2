@@ -643,6 +643,9 @@ def parse_supabase_ts(ts_str):
 @jwt_required() # Keep this if you only want logged-in users to see the feed
 def get_posts():
     try:
+        # 1. Grab the ID of the person holding the phone
+        current_user_id = get_jwt_identity()
+
         url = f"{os.getenv('SUPABASE_URL')}/rest/v1/posts"
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
@@ -663,9 +666,27 @@ def get_posts():
         if response.status_code == 200:
             posts = response.json()
             
-            # (Optional) Flatten the data so Flutter reads it easily
-            # Supabase returns users as a nested dictionary: {"users": {"username": "John"}}
-            # Flutter expects it the exact way you wrote it in post_feed.dart, so this is perfect!
+            # --- ✨ THE NEW PERSONALIZATION LOGIC ✨ ---
+            liked_post_ids = set()
+            
+            # Go ask the post_likes table what THIS user has liked
+            likes_url = f"{os.getenv('SUPABASE_URL')}/rest/v1/post_likes"
+            likes_params = {
+                "user_id": f"eq.{current_user_id}",
+                "select": "post_id"
+            }
+            likes_res = requests.get(likes_url, headers=headers, params=likes_params)
+            
+            if likes_res.status_code == 200:
+                # Convert the response into a fast, searchable set of IDs
+                likes_data = likes_res.json()
+                liked_post_ids = {str(like['post_id']) for like in likes_data}
+
+            # Loop through the feed and tag the ones they've liked!
+            for post in posts:
+                post_id_str = str(post.get('id'))
+                post['is_liked'] = post_id_str in liked_post_ids
+            # ------------------------------------------
             
             return jsonify({
                 "success": True, 
