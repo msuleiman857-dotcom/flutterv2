@@ -369,23 +369,17 @@ def api_login():
     bot_token = str(data.get("captcha_token", ""))
     pow_challenge_id = str(data.get("pow_challenge_id", ""))
     pow_answer = str(data.get("pow_answer", ""))
-
-    # 2. PROOF OF WORK VERIFICATION
-    # if not verify_pow(pow_challenge_id, pow_answer):
-    #     logging.warning(f"Failed PoW challenge from IP: {client_ip}")
-    #     return jsonify({"status": "error", "message": "Security verification failed."}), 403
-
-    # 3. BOT PROTECTION
-    # if not verify_bot_token(bot_token, client_ip):
-    #     logging.warning(f"Failed bot challenge from IP: {client_ip}")
-    #     return jsonify({"status": "error", "message": "Security verification failed."}), 403
+    
+    # ✨ NEW: Grab the location from the incoming Flutter payload. 
+    # Fallback safely to "Unknown" if the user denied permission on the frontend.
+    user_location = str(data.get("location", "Unknown")).strip()
 
     # Input length limits to prevent extreme payload DoS
     if len(identifier) < 3 or not (1 <= len(password) <= 128):
         return jsonify({'status': 'error', 'message': 'Invalid credentials'}), 401
 
     try:
-        # ✨ NEW SUPABASE HTTPS BYPASS ✨
+        # SUPABASE REST API CONFIG
         url = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
@@ -422,6 +416,21 @@ def api_login():
         if is_valid_login:
             access_token = create_access_token(identity=str(user['id']))
             logging.info(f"Successful login for user ID: {user['id']}")
+
+            # ✨ NEW: UPDATE USER LOCATION IN SUPABASE POST-LOGIN ✨
+            # We target the row matching this specific user ID and PATCH the location column
+            try:
+                update_url = f"{url}?id=eq.{user['id']}"
+                update_payload = {"location": user_location}
+                
+                update_response = requests.patch(update_url, headers=headers, json=update_payload)
+                
+                if update_response.status_code not in [200, 204]:
+                    logging.error(f"Failed to update location in Supabase: {update_response.text}")
+                    # We do NOT crash the login flow here. If the location update fails for some reason, 
+                    # we still let the user log in successfully.
+            except Exception as loc_err:
+                logging.error(f"Error firing location sync to database: {loc_err}")
 
             return jsonify({
                 'status': 'success',
