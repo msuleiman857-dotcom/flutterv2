@@ -293,11 +293,17 @@ def supabase_likes_webhook():
 def supabase_posts_webhook():
     data = request.get_json(silent=True) or {}
     
-    # Check if a new row was inserted into Supabase
     if data.get('type') == 'INSERT':
-        # Emit the event to all Flutter apps!
-        # Flutter just uses this to run _fetchFeed(), so the payload structure doesn't matter much
-        socketio.emit('new_post_added', {"message": "New post added in Supabase!"})
+        record = data.get('record', {})
+        poster_user_id = str(record.get('user_id', ''))
+        
+        # Broadcast to everyone EXCEPT the poster (they already have it)
+        for uid, sid in active_users.items():
+            if uid != poster_user_id:
+                socketio.emit('new_post_added', 
+                    {"message": "New post added!"}, 
+                    room=sid
+                )
         
     return jsonify({"status": "success"}), 200
 
