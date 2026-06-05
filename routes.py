@@ -31,7 +31,8 @@ load_dotenv(os.path.expanduser("~/flas/.env"))
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "flutterv2", "firebase", "firebase-key.json")
+FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "firebase", "firebase-key.json")
+
 if not firebase_admin._apps:
     try:
         cred = credentials.Certificate(FIREBASE_KEY_PATH)
