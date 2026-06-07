@@ -840,34 +840,32 @@ def get_conversations(user_id):
 @jwt_required()
 def get_upload_url():
     data = request.get_json(silent=True) or {}
-    filename  = data.get('filename')   # e.g. "abc123.mp4"
-    mime_type = data.get('mime_type')  # e.g. "video/mp4"
+    filename  = data.get('filename')
+    mime_type = data.get('mime_type')
     user_id   = get_jwt_identity()
 
     if not filename or not mime_type:
         return jsonify({'success': False, 'message': 'filename and mime_type required'}), 400
 
-    # Build the storage path exactly like poster.dart does now
     storage_path = f"posts/{user_id}/{filename}"
 
     try:
-        # Ask Supabase to create a signed upload URL for this path
         url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/upload/sign/meetup/{storage_path}"
         headers = {
-            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "apikey":        os.getenv('SUPABASE_SERVICE_KEY'),
             "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
             "Content-Type":  "application/json",
         }
 
+        # 👇 ADD THESE THREE LINES
         response = requests.post(url, headers=headers)
+        logging.error(f"Supabase status: {response.status_code}")
+        logging.error(f"Supabase response: {response.text}")
 
         if response.status_code not in (200, 201):
-            logging.error(f"Supabase signed URL error: {response.text}")
             return jsonify({'success': False, 'message': 'Could not generate upload URL'}), 500
 
-        signed_url = response.json().get('url')  # Supabase returns the full signed URL here
-
-        # Also return the final public URL Flutter will use when saving the post
+        signed_url = response.json().get('url')
         public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/meetup/{storage_path}"
 
         return jsonify({
@@ -880,7 +878,6 @@ def get_upload_url():
     except Exception as e:
         logging.error(f"get_upload_url error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
-
 @app.route('/api/messages/<string:user_id>/<string:other_id>', methods=['GET'])
 @jwt_required()
 def get_private_messages(user_id, other_id):
