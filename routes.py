@@ -864,7 +864,7 @@ def get_upload_url():
         if response.status_code not in (200, 201):
             return jsonify({'success': False, 'message': 'Could not generate upload URL'}), 500
 
-        signed_url = response.json().get('url')
+        signed_url = f"{os.getenv('SUPABASE_URL')}{response.json().get('url')}"
         public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/meetup/{storage_path}"
 
         return jsonify({
