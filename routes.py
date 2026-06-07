@@ -852,9 +852,8 @@ def get_upload_url():
     try:
         url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/upload/sign/meetup/{storage_path}"
         headers = {
-            "apikey":        os.getenv('SUPABASE_SERVICE_KEY'),
-            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
-            "Content-Type":  "application/json",
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
         }
 
         # 👇 ADD THESE THREE LINES
