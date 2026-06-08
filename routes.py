@@ -711,7 +711,7 @@ def get_posts():
         # "*,users(username)" tells Supabase: 
         # "Get all post data (*), and JOIN the users table to get just the username"
         params = {
-            "select": "*,users(username, longitude, latitude)", 
+            "select": "*,users(username, longitude, latitude, price_naira)", 
             "order": "created_at.desc",     # Newest posts first
             "limit": "20"                   # Only grab 20 at a time to keep it lightning fast
         }
