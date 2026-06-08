@@ -787,8 +787,7 @@ def create_post():
             "poster_id": str(poster_id),
             "video_url": video_url,
             "caption": caption,
-            "target_gender": target_gender,
-            "price_naira": price_naira
+            "target_gender": target_gender
         }
         
         response = requests.post(url, headers=headers, json=payload)
