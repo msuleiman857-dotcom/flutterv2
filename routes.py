@@ -800,7 +800,7 @@ def create_post():
             user_res = requests.get(
                 f"{os.getenv('SUPABASE_URL')}/rest/v1/users",
                 headers={"apikey": headers["apikey"], "Authorization": headers["Authorization"]},
-                params={"id": f"eq.{poster_id}", "select": "username,profile_pic_url"}
+                params={"id": f"eq.{poster_id}", "select": "username,profile_pic_url,price_naira"}
             )
             
             if user_res.status_code == 200 and len(user_res.json()) > 0:
