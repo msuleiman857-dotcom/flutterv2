@@ -418,6 +418,8 @@ def api_login():
     # ✨ NEW: Grab the location from the incoming Flutter payload. 
     # Fallback safely to "Unknown" if the user denied permission on the frontend.
     user_location = str(data.get("location", "Unknown")).strip()
+    user_latitude = data.get("latitude")   # NEW
+    user_longitude = data.get("longitude")
 
     # Input length limits to prevent extreme payload DoS
     if len(identifier) < 3 or not (1 <= len(password) <= 128):
@@ -466,7 +468,7 @@ def api_login():
             # We target the row matching this specific user ID and PATCH the location column
             try:
                 update_url = f"{url}?id=eq.{user['id']}"
-                update_payload = {"location": user_location}
+                update_payload = {"location": user_location, "latitude": user_latitude, "longitude": user_longitude}
                 
                 update_response = requests.patch(update_url, headers=headers, json=update_payload)
                 
