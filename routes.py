@@ -896,8 +896,6 @@ def get_upload_url():
 
         # 👇 ADD THESE THREE LINES
         response = requests.post(url, headers=headers)
-        logging.error(f"Supabase status: {response.status_code}")
-        logging.error(f"Supabase response: {response.text}")
 
         if response.status_code not in (200, 201):
             return jsonify({'success': False, 'message': 'Could not generate upload URL'}), 500
