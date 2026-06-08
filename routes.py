@@ -760,11 +760,16 @@ def get_posts():
 def create_post():
     data = request.get_json(silent=True) or {}
     poster_id = get_jwt_identity()
+    price_res = requests.get(
+        f"{os.getenv('SUPABASE_URL')}/rest/v1/users",
+        headers={"apikey": os.getenv('SUPABASE_SERVICE_KEY'), "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"},
+        params={"id": f"eq.{poster_id}", "select": "price_naira"}
+    )
+    price_naira = price_res.json()[0].get('price_naira', 0.0) if price_res.status_code == 200 and price_res.json() else 0.0
     
     video_url = data.get('video_url', '')
     caption = data.get('caption', '')
     target_gender = data.get('target_gender', 'Male')
-    price_naira = data.get('price_naira', 0.0)
 
     if not video_url:
         return jsonify({"status": "error", "message": "Video/Media URL is required"}), 400
