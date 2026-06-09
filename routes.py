@@ -330,30 +330,57 @@ def supabase_likes_webhook():
 
 @app.route('/api/webhook/kyc_status', methods=['POST'])
 def kyc_status_webhook():
-    try:
-        payload = request.get_json(silent=True)
-        if not payload:
-            return jsonify({"status": "error", "message": "No payload"}), 400
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "error", "message": "No payload received"}), 400
 
-        # Supabase sends old_record and record on UPDATE
-        old_record = payload.get('old_record', {})
-        new_record = payload.get('record', {})
+    print("DEBUG: KYC Webhook payload received:", data)
 
-        old_kyc = old_record.get('kyc_status')
-        new_kyc = new_record.get('kyc_status')
-        user_id = new_record.get('id')
+    old_record = data.get('old_record') if data.get('old_record') is not None else {}
+    record = data.get('record') if data.get('record') is not None else {}
 
-        # Only emit if kyc_status actually flipped to verified
-        if old_kyc != new_kyc and new_kyc == 'verified' and user_id:
-            socketio.emit('user_kyc_verified', {'user_id': str(user_id)})
-            logging.info(f"KYC verified socket emitted for user: {user_id}")
+    if not record:
+        return jsonify({"status": "error", "message": "No record found in payload"}), 400
 
-        return jsonify({"status": "ok"}), 200
+    user_id = record.get('id')
+    old_kyc = old_record.get('kyc_status')
+    new_kyc = record.get('kyc_status')
 
-    except Exception as e:
-        logging.error(f"KYC webhook error: {e}")
-        return jsonify({"status": "error"}), 500
+    if not user_id:
+        return jsonify({"status": "error", "message": "No user_id in record"}), 400
 
+    if old_kyc != new_kyc:
+        try:
+            supabase_url = os.getenv('SUPABASE_URL')
+            supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+            headers = {
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}"
+            }
+
+            # Go back to Supabase to confirm the real current kyc_status
+            response = requests.get(
+                f"{supabase_url}/rest/v1/users?id=eq.{user_id}&select=kyc_status",
+                headers=headers
+            )
+
+            if response.status_code == 200 and response.json():
+                actual_kyc = response.json()[0].get('kyc_status')
+                print(f"DEBUG: Confirmed KYC from Supabase for user {user_id}: {actual_kyc}")
+
+                if actual_kyc == 'verified':
+                    socketio.emit('user_kyc_verified', {'user_id': str(user_id)})
+                    print(f"DEBUG: Broadcast KYC verified for user: {user_id}")
+            else:
+                print(f"ERROR: Supabase returned {response.status_code}: {response.text}")
+                return jsonify({"status": "error", "message": "Failed to verify KYC from DB"}), 500
+
+        except Exception as e:
+            print(f"CRITICAL KYC WEBHOOK EXCEPTION: {str(e)}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    return jsonify({"status": "success"}), 200
+    
 @app.route('/api/webhook/supabase-posts', methods=['POST'])
 def supabase_posts_webhook():
     data = request.get_json(silent=True) or {}
@@ -737,7 +764,7 @@ def get_posts():
         # "*,users(username)" tells Supabase: 
         # "Get all post data (*), and JOIN the users table to get just the username"
         params = {
-            "select": "*,users(username, longitude, latitude, price_naira, kyc_status)", 
+            "select": "*,users(username, longitude, latitude, price_naira, kyc)", 
             "order": "created_at.desc",     # Newest posts first
             "limit": "20"                   # Only grab 20 at a time to keep it lightning fast
         }
