@@ -328,6 +328,32 @@ def supabase_likes_webhook():
         print(f"CRITICAL WEBHOOK EXCEPTION: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route('/api/webhook/kyc_status', methods=['POST'])
+def kyc_status_webhook():
+    try:
+        payload = request.get_json(silent=True)
+        if not payload:
+            return jsonify({"status": "error", "message": "No payload"}), 400
+
+        # Supabase sends old_record and record on UPDATE
+        old_record = payload.get('old_record', {})
+        new_record = payload.get('record', {})
+
+        old_kyc = old_record.get('kyc_status')
+        new_kyc = new_record.get('kyc_status')
+        user_id = new_record.get('id')
+
+        # Only emit if kyc_status actually flipped to verified
+        if old_kyc != new_kyc and new_kyc == 'verified' and user_id:
+            socketio.emit('user_kyc_verified', {'user_id': str(user_id)})
+            logging.info(f"KYC verified socket emitted for user: {user_id}")
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        logging.error(f"KYC webhook error: {e}")
+        return jsonify({"status": "error"}), 500
+
 @app.route('/api/webhook/supabase-posts', methods=['POST'])
 def supabase_posts_webhook():
     data = request.get_json(silent=True) or {}
@@ -711,7 +737,7 @@ def get_posts():
         # "*,users(username)" tells Supabase: 
         # "Get all post data (*), and JOIN the users table to get just the username"
         params = {
-            "select": "*,users(username, longitude, latitude, price_naira)", 
+            "select": "*,users(username, longitude, latitude, price_naira, kyc_status)", 
             "order": "created_at.desc",     # Newest posts first
             "limit": "20"                   # Only grab 20 at a time to keep it lightning fast
         }
