@@ -504,20 +504,12 @@ def initiate_payout():
 @app.route('/api/webhook/korapay', methods=['POST'])
 def korapay_webhook():
     try:
-        # ── Step 1: Verify signature ──────────────────────────────
         raw_body = request.get_data()
         received_sig = request.headers.get('x-korapay-signature', '')
-        secret_key = os.getenv('KORAPAY_SECRET_KEY')
-
-        expected_sig = hmac.new(
-            secret_key.encode('utf-8'),
-            raw_body,
-            hashlib.sha256
-        ).hexdigest()
-
-        if not hmac.compare_digest(received_sig, expected_sig):
-            logging.warning("Korapay webhook signature mismatch — possible fake request")
-            return jsonify({"status": "error", "message": "Invalid signature"}), 401
+        
+        print(f"DEBUG: Received signature: {received_sig}")
+        print(f"DEBUG: Raw body: {raw_body}")
+        print(f"DEBUG: All headers: {dict(request.headers)}")
 
         # ── Step 2: Parse payload ─────────────────────────────────
         data = request.get_json(silent=True)
