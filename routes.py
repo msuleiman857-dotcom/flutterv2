@@ -368,7 +368,7 @@ def kyc_status_webhook():
                 actual_kyc = response.json()[0].get('kyc')
                 print(f"DEBUG: Confirmed KYC from Supabase for user {user_id}: {actual_kyc}")
 
-                if actual_kyc == 'verified':
+                if actual_kyc == True:
                     socketio.emit('user_kyc_verified', {'user_id': str(user_id)})
                     print(f"DEBUG: Broadcast KYC verified for user: {user_id}")
             else:
