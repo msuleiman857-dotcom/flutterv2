@@ -5,6 +5,8 @@ import eventlet
 eventlet.monkey_patch()
 
 from flask import Flask, request, jsonify
+import hmac
+import hashlib
 from database_connector import generate_reset_code
 from flask_limiter import Limiter
 from flask_socketio import SocketIO
@@ -413,6 +415,10 @@ def initiate_payout():
         amount = data.get('amount')
         customer_name = data.get('username')
         customer_email = data.get('email', 'customer@payme.app')
+        recipient_id = data.get('recipient_id')
+        
+        if not recipient_id:
+            return jsonify({"status": "error", "message": "Recipient ID is required"}), 400
 
         if not amount or not customer_name:
             return jsonify({"status": "error", "message": "Amount and username are required"}), 400
@@ -455,6 +461,27 @@ def initiate_payout():
         if response.status_code == 200 and response_data.get('status') is True:
             bank = response_data['data']['bank_account']
             logging.info(f"Payout initiated for user {user_id}, reference: {unique_reference}")
+            # Insert pending payment row into Supabase
+            try:
+                payments_url = f"{os.getenv('SUPABASE_URL')}/rest/v1/payments"
+                payment_headers = {
+                    "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+                    "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal"
+                }
+                payment_payload = {
+                    "reference": unique_reference,
+                    "payer_id": str(user_id),
+                    "recipient_id": str(recipient_id),
+                    "amount": amount,
+                    "status": "pending"
+                }
+                pay_res = requests.post(payments_url, headers=payment_headers, json=payment_payload)
+                if pay_res.status_code not in [200, 201]:
+                    logging.error(f"Failed to insert payment row: {pay_res.text}")
+            except Exception as pay_err:
+                logging.error(f"Payment row insert error: {pay_err}")
             return jsonify({
                 "status": "success",
                 "reference": unique_reference,
@@ -473,6 +500,98 @@ def initiate_payout():
     except Exception as e:
         logging.error(f"Payout initiation error for user {user_id}: {e}")
         return jsonify({"status": "error", "message": "An internal error occurred"}), 500
+
+@app.route('/api/webhook/korapay', methods=['POST'])
+def korapay_webhook():
+    try:
+        # ── Step 1: Verify signature ──────────────────────────────
+        raw_body = request.get_data()
+        received_sig = request.headers.get('x-korapay-signature', '')
+        secret_key = os.getenv('KORAPAY_SECRET_KEY')
+
+        expected_sig = hmac.new(
+            secret_key.encode('utf-8'),
+            raw_body,
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(received_sig, expected_sig):
+            logging.warning("Korapay webhook signature mismatch — possible fake request")
+            return jsonify({"status": "error", "message": "Invalid signature"}), 401
+
+        # ── Step 2: Parse payload ─────────────────────────────────
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"status": "error", "message": "No payload"}), 400
+
+        print("DEBUG: Korapay webhook payload:", data)
+
+        event = data.get('event')
+        payment_data = data.get('data', {})
+        reference = payment_data.get('reference')
+        status = payment_data.get('status')
+
+        if not reference:
+            return jsonify({"status": "error", "message": "No reference"}), 400
+
+        # ── Step 3: Only handle successful charges ────────────────
+        if event != 'charge.success' or status != 'success':
+            return jsonify({"status": "ok", "message": "Event ignored"}), 200
+
+        # ── Step 4: Verify reference exists in your payments table ─
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json"
+        }
+
+        pay_res = requests.get(
+            f"{supabase_url}/rest/v1/payments?reference=eq.{reference}&select=*",
+            headers=headers
+        )
+
+        if pay_res.status_code != 200 or not pay_res.json():
+            logging.error(f"Korapay webhook: reference not found: {reference}")
+            return jsonify({"status": "error", "message": "Reference not found"}), 404
+
+        payment = pay_res.json()[0]
+
+        # ── Step 5: Guard against double processing ───────────────
+        if payment['status'] == 'success':
+            logging.info(f"Korapay webhook: reference already confirmed: {reference}")
+            return jsonify({"status": "ok", "message": "Already processed"}), 200
+
+        # ── Step 6: Flip status to success in Supabase ───────────
+        from datetime import datetime, timezone
+        update_res = requests.patch(
+            f"{supabase_url}/rest/v1/payments?reference=eq.{reference}",
+            headers=headers,
+            json={
+                "status": "success",
+                "confirmed_at": datetime.now(timezone.utc).isoformat()
+            }
+        )
+
+        if update_res.status_code not in [200, 204]:
+            logging.error(f"Failed to update payment status: {update_res.text}")
+            return jsonify({"status": "error", "message": "DB update failed"}), 500
+
+        # ── Step 7: Emit socket to payer's Flutter app ────────────
+        socketio.emit('payment_confirmed', {
+            'reference': reference,
+            'payer_id': payment['payer_id'],
+            'recipient_id': payment['recipient_id'],
+            'amount': str(payment['amount'])
+        })
+
+        logging.info(f"Payment confirmed and emitted for reference: {reference}")
+        return jsonify({"status": "success"}), 200
+
+    except Exception as e:
+        logging.error(f"Korapay webhook error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/update-token', methods=['POST'])
 @jwt_required()
