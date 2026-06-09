@@ -343,8 +343,8 @@ def kyc_status_webhook():
         return jsonify({"status": "error", "message": "No record found in payload"}), 400
 
     user_id = record.get('id')
-    old_kyc = old_record.get('kyc_status')
-    new_kyc = record.get('kyc_status')
+    old_kyc = old_record.get('kyc')
+    new_kyc = record.get('kyc')
 
     if not user_id:
         return jsonify({"status": "error", "message": "No user_id in record"}), 400
@@ -360,12 +360,12 @@ def kyc_status_webhook():
 
             # Go back to Supabase to confirm the real current kyc_status
             response = requests.get(
-                f"{supabase_url}/rest/v1/users?id=eq.{user_id}&select=kyc_status",
+                f"{supabase_url}/rest/v1/users?id=eq.{user_id}&select=kyc",
                 headers=headers
             )
 
             if response.status_code == 200 and response.json():
-                actual_kyc = response.json()[0].get('kyc_status')
+                actual_kyc = response.json()[0].get('kyc')
                 print(f"DEBUG: Confirmed KYC from Supabase for user {user_id}: {actual_kyc}")
 
                 if actual_kyc == 'verified':
