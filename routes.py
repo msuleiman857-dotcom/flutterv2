@@ -399,6 +399,81 @@ def supabase_posts_webhook():
         
     return jsonify({"status": "success"}), 200
 
+@app.route('/api/payout/initiate', methods=['POST'])
+@jwt_required()
+@limiter.limit("4 per hour")
+def initiate_payout():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json(silent=True)
+
+        if not data:
+            return jsonify({"status": "error", "message": "Invalid request"}), 400
+
+        amount = data.get('amount')
+        customer_name = data.get('username')
+        customer_email = data.get('email', 'customer@payme.app')
+
+        if not amount or not customer_name:
+            return jsonify({"status": "error", "message": "Amount and username are required"}), 400
+
+        try:
+            amount = float(amount)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            return jsonify({"status": "error", "message": "Invalid amount"}), 400
+
+        unique_reference = f"PAYME-{user_id[:8].upper()}-{uuid.uuid4().hex[:6].upper()}"
+
+        payload = {
+            "reference": unique_reference,
+            "amount": amount,
+            "currency": "NGN",
+            "notification_url": f"{os.getenv('APP_BASE_URL')}/api/webhook/korapay",
+            "customer": {
+                "name": customer_name,
+                "email": customer_email
+            },
+            "auto_complete": False
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.getenv('KORAPAY_SECRET_KEY')}"
+        }
+
+        response = requests.post(
+            "https://api.korapay.com/merchant/api/v1/charges/bank-transfer",
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+
+        response_data = response.json()
+
+        if response.status_code == 200 and response_data.get('status') is True:
+            bank = response_data['data']['bank_account']
+            logging.info(f"Payout initiated for user {user_id}, reference: {unique_reference}")
+            return jsonify({
+                "status": "success",
+                "reference": unique_reference,
+                "amount_expected": response_data['data']['amount_expected'],
+                "account_name": bank['account_name'],
+                "account_number": bank['account_number'],
+                "bank_name": bank['bank_name'],
+                "expires_at": bank['expiry_date_in_utc']
+            }), 200
+        else:
+            logging.error(f"Korapay error for user {user_id}: {response_data}")
+            return jsonify({"status": "error", "message": "Payment provider error. Try again."}), 502
+
+    except requests.exceptions.Timeout:
+        return jsonify({"status": "error", "message": "Payment provider timed out. Try again."}), 504
+    except Exception as e:
+        logging.error(f"Payout initiation error for user {user_id}: {e}")
+        return jsonify({"status": "error", "message": "An internal error occurred"}), 500
+
 @app.route('/api/update-token', methods=['POST'])
 @jwt_required()
 def api_update_token():
