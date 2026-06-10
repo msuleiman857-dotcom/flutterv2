@@ -520,14 +520,10 @@ def korapay_webhook():
             hashlib.sha256
         ).hexdigest()
 
-        print(f"DEBUG: received={received_sig}")
-        print(f"DEBUG: expected={expected_sig}")
-
         if received_sig and not hmac.compare_digest(received_sig, expected_sig):
             logging.warning("Korapay webhook signature mismatch")
             return jsonify({"status": "error", "message": "Invalid signature"}), 401
 
-        print("DEBUG: Korapay webhook payload:", data)
         event = data.get('event')
         payment_data = data.get('data', {})
         reference = payment_data.get('reference')
