@@ -583,6 +583,28 @@ def korapay_webhook():
         logging.error(f"Korapay webhook error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route('/api/payments/check/<reference>', methods=['GET'])
+@jwt_required()
+def check_payment(reference):
+    try:
+        user_id = get_jwt_identity()
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+        res = requests.get(
+            f"{supabase_url}/rest/v1/payments?reference=eq.{reference}&payer_id=eq.{user_id}&select=status",
+            headers=headers
+        )
+        if res.status_code == 200 and res.json():
+            return jsonify({"status": "success", "payment_status": res.json()[0]['status']}), 200
+        return jsonify({"status": "error", "message": "Payment not found"}), 404
+    except Exception as e:
+        logging.error(f"Payment check error: {e}")
+        return jsonify({"status": "error"}), 500
+
 @app.route('/api/update-token', methods=['POST'])
 @jwt_required()
 def api_update_token():
