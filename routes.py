@@ -12,6 +12,7 @@ from flask_limiter import Limiter
 from flask_socketio import SocketIO
 from flask_limiter.util import get_remote_address
 import logging
+import json
 import requests
 from dotenv import load_dotenv
 from email_security import send_reset_email, send_verify_email
@@ -502,28 +503,31 @@ def initiate_payout():
 @app.route('/api/webhook/korapay', methods=['POST'])
 def korapay_webhook():
     try:
-        raw_body = request.get_data()
         received_sig = request.headers.get('X-Korapay-Signature', '')
         secret_key = os.getenv('KORAPAY_SECRET_KEY')
-        
-        expected_sig = hashlib.sha256(
-            raw_body + secret_key.encode('utf-8')
-        ).hexdigest()
-        
-        print(f"DEBUG: received={received_sig}")
-        print(f"DEBUG: expected={expected_sig}")
-        
-        if received_sig and not hmac.compare_digest(received_sig, expected_sig):
-            logging.warning("Korapay webhook signature mismatch")
-            return jsonify({"status": "error", "message": "Invalid signature"}), 401
 
-        # ── Step 2: Parse payload ─────────────────────────────────
+        # Parse payload first
         data = request.get_json(silent=True)
         if not data:
             return jsonify({"status": "error", "message": "No payload"}), 400
 
-        print("DEBUG: Korapay webhook payload:", data)
+        # Sign ONLY the data object as Korapay docs specify
+        data_object = data.get('data', {})
+        data_string = json.dumps(data_object, separators=(',', ':'), sort_keys=False)
+        expected_sig = hmac.new(
+            secret_key.encode('utf-8'),
+            data_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
 
+        print(f"DEBUG: received={received_sig}")
+        print(f"DEBUG: expected={expected_sig}")
+
+        if received_sig and not hmac.compare_digest(received_sig, expected_sig):
+            logging.warning("Korapay webhook signature mismatch")
+            return jsonify({"status": "error", "message": "Invalid signature"}), 401
+
+        print("DEBUG: Korapay webhook payload:", data)
         event = data.get('event')
         payment_data = data.get('data', {})
         reference = payment_data.get('reference')
@@ -532,11 +536,9 @@ def korapay_webhook():
         if not reference:
             return jsonify({"status": "error", "message": "No reference"}), 400
 
-        # ── Step 3: Only handle successful charges ────────────────
         if event != 'charge.success' or status != 'success':
             return jsonify({"status": "ok", "message": "Event ignored"}), 200
 
-        # ── Step 4: Verify reference exists in your payments table ─
         supabase_url = os.getenv('SUPABASE_URL')
         supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
         headers = {
@@ -549,20 +551,16 @@ def korapay_webhook():
             f"{supabase_url}/rest/v1/payments?reference=eq.{reference}&select=*",
             headers=headers
         )
-
         if pay_res.status_code != 200 or not pay_res.json():
             logging.error(f"Korapay webhook: reference not found: {reference}")
             return jsonify({"status": "error", "message": "Reference not found"}), 404
 
         payment = pay_res.json()[0]
 
-        # ── Step 5: Guard against double processing ───────────────
         if payment['status'] == 'success':
-            logging.info(f"Korapay webhook: reference already confirmed: {reference}")
+            logging.info(f"Korapay webhook: already confirmed: {reference}")
             return jsonify({"status": "ok", "message": "Already processed"}), 200
 
-        # ── Step 6: Flip status to success in Supabase ───────────
-        from datetime import datetime, timezone
         update_res = requests.patch(
             f"{supabase_url}/rest/v1/payments?reference=eq.{reference}",
             headers=headers,
@@ -571,12 +569,10 @@ def korapay_webhook():
                 "confirmed_at": datetime.now(timezone.utc).isoformat()
             }
         )
-
         if update_res.status_code not in [200, 204]:
             logging.error(f"Failed to update payment status: {update_res.text}")
             return jsonify({"status": "error", "message": "DB update failed"}), 500
 
-        # ── Step 7: Emit socket to payer's Flutter app ────────────
         socketio.emit('payment_confirmed', {
             'reference': reference,
             'payer_id': payment['payer_id'],
