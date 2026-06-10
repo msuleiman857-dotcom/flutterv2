@@ -1156,21 +1156,17 @@ def get_upload_url():
         }
         response = requests.post(url, headers=headers)
         resp_data = response.json()
-        logging.info(f"Supabase signed URL response: {resp_data}")
         
         if response.status_code not in (200, 201):
             return jsonify({'success': False, 'message': 'Could not generate upload URL'}), 500
         
         raw_url = resp_data.get('url', '')
-        logging.info(f"Raw url field from Supabase: {raw_url}")
         
         # Avoid double /storage/v1 if Supabase already includes it
         if raw_url.startswith('/storage/v1'):
             signed_url = f"{os.getenv('SUPABASE_URL')}{raw_url}"
         else:
             signed_url = f"{os.getenv('SUPABASE_URL')}/storage/v1{raw_url}"
-        
-        logging.info(f"Final signed_url: {signed_url}")
         
         public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/meetup/{storage_path}"
         return jsonify({
