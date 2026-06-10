@@ -1145,38 +1145,44 @@ def get_upload_url():
     filename  = data.get('filename')
     mime_type = data.get('mime_type')
     user_id   = get_jwt_identity()
-
     if not filename or not mime_type:
         return jsonify({'success': False, 'message': 'filename and mime_type required'}), 400
-
     storage_path = f"posts/{user_id}/{filename}"
-
     try:
         url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/upload/sign/meetup/{storage_path}"
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
             "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
         }
-
-        # 👇 ADD THESE THREE LINES
         response = requests.post(url, headers=headers)
-
+        resp_data = response.json()
+        logging.info(f"Supabase signed URL response: {resp_data}")
+        
         if response.status_code not in (200, 201):
             return jsonify({'success': False, 'message': 'Could not generate upload URL'}), 500
-
-        signed_url = f"{os.getenv('SUPABASE_URL')}{response.json().get('url')}"
+        
+        raw_url = resp_data.get('url', '')
+        logging.info(f"Raw url field from Supabase: {raw_url}")
+        
+        # Avoid double /storage/v1 if Supabase already includes it
+        if raw_url.startswith('/storage/v1'):
+            signed_url = f"{os.getenv('SUPABASE_URL')}{raw_url}"
+        else:
+            signed_url = f"{os.getenv('SUPABASE_URL')}/storage/v1{raw_url}"
+        
+        logging.info(f"Final signed_url: {signed_url}")
+        
         public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/meetup/{storage_path}"
-
         return jsonify({
             'success':    True,
             'signed_url': signed_url,
             'public_url': public_url,
             'path':       storage_path,
         }), 200
-
     except Exception as e:
         logging.error(f"get_upload_url error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
+        
 @app.route('/api/messages/<string:user_id>/<string:other_id>', methods=['GET'])
 @jwt_required()
 def get_private_messages(user_id, other_id):
