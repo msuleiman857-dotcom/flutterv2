@@ -336,8 +336,6 @@ def kyc_status_webhook():
     if not data:
         return jsonify({"status": "error", "message": "No payload received"}), 400
 
-    print("DEBUG: KYC Webhook payload received:", data)
-
     old_record = data.get('old_record') if data.get('old_record') is not None else {}
     record = data.get('record') if data.get('record') is not None else {}
 
@@ -508,10 +506,8 @@ def korapay_webhook():
         received_sig = request.headers.get('X-Korapay-Signature', '')
         secret_key = os.getenv('KORAPAY_SECRET_KEY')
         
-        expected_sig = hmac.new(
-            secret_key.encode('utf-8'),
-            raw_body,
-            hashlib.sha256
+        expected_sig = hashlib.sha256(
+            raw_body + secret_key.encode('utf-8')
         ).hexdigest()
         
         print(f"DEBUG: received={received_sig}")
