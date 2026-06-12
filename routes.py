@@ -1105,6 +1105,7 @@ def get_conversations(user_id):
             return jsonify({"status": "error", "message": "Database error"}), 500
 
         conversations = response.json()
+        print(conversations)
 
         # You might need to update this to the HTTPS version too if it still uses cursors!
         current_user_premium = bool(is_premium_user(None, user_id))
