@@ -160,11 +160,15 @@ def handle_mark_as_read(data):
 
         # 2. Real-time "Tap on the shoulder" for the Sender
         # If the sender is currently online, tell their app to update the UI instantly
+        print(f"DEBUG mark_as_read: sender_id={sender_id}, active_users={list(active_users.keys())}")
         if str(sender_id) in active_users:
             sender_sid = active_users[str(sender_id)]
+            print(f"DEBUG emitting message_read_update to sid={sender_sid}")
             socketio.emit('message_read_update', {
                 'message_id': message_id
             }, room=sender_sid)
+        else:
+            print(f"DEBUG sender_id {sender_id} NOT in active_users — relay skipped")
             
     except Exception as e:
         logging.error(f"Error in mark_as_read relay: {e}")
