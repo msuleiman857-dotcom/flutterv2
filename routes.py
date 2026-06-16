@@ -741,8 +741,7 @@ def api_login():
                 'status': 'success',
                 'username': user['username'],
                 'id': user['id'],
-                'access_token': access_token,
-                'kyc': user.get('kyc', False)  # ← ADD THIS
+                'access_token': access_token
             }), 200
         else:
             logging.warning(f"Failed login attempt for identifier: {identifier} from IP: {client_ip}")
@@ -1278,53 +1277,6 @@ def is_premium_user(conn, user_id):
         logging.error(f"Premium check error: {e}")
         return False
 
-@socketio.on('typing')
-def handle_typing(data):
-    """
-    Handles typing status via WebSockets.
-    This replaces the /api/set_typing HTTP route and stops the logs.
-    """
-    sender_id = str(data.get('sender_id'))
-    receiver_id = str(data.get('receiver_id'))
-    is_typing = data.get('is_typing', False)
-    typing_text = data.get('typing_text', "")
-
-    # 1. Update the database (Supabase) via HTTPS Bypass
-    try:
-        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/typing_status"
-        headers = {
-            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
-            "Content-Type": "application/json"
-        }
-
-        if is_typing:
-            # UPSERT: Insert or update if exists
-            headers["Prefer"] = "resolution=merge-duplicates"
-            payload = {
-                "sender_id": sender_id,
-                "receiver_id": receiver_id,
-                "is_typing": True,
-                "typing_text": str(typing_text),
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-            requests.post(url, headers=headers, json=payload)
-        else:
-            # DELETE: Remove the typing indicator
-            params = {"sender_id": f"eq.{sender_id}", "receiver_id": f"eq.{receiver_id}"}
-            requests.delete(url, headers=headers, params=params)
-
-        # 2. Real-time Relay: Tell the receiver instantly
-        if receiver_id in active_users:
-            socketio.emit('typing', {
-                'sender_id': sender_id,
-                'is_typing': is_typing,
-                'typing_text': typing_text
-            }, room=active_users[receiver_id])
-
-    except Exception as e:
-        logging.error(f"Error in socket typing relay: {e}")
-        
 @app.route("/api/send_message", methods=["POST"])
 @jwt_required()
 def api_send_message():
@@ -2144,4 +2096,3 @@ def check_premium_status(user_id):
     except Exception as e:
         logging.error(f"Check premium error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
-
