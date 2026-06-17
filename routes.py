@@ -123,6 +123,15 @@ def upload_media():
     except Exception as e:
         logging.error(f"upload_media error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
+
+@socketio.on('profile_pic_updated')
+def handle_profile_pic_updated(data):
+    user_id = str(data.get('user_id'))
+    url = data.get('profile_pic_url')
+    socketio.emit('profile_pic_updated', {
+        'user_id': user_id,
+        'profile_pic_url': url
+    }, broadcast=True)
         
 @socketio.on('mark_as_read')
 def handle_mark_as_read(data):
