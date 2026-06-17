@@ -745,7 +745,8 @@ def api_login():
                 'status': 'success',
                 'username': user['username'],
                 'id': user['id'],
-                'access_token': access_token
+                'access_token': access_token,
+                'kyc': user.get('kyc', False)
             }), 200
         else:
             logging.warning(f"Failed login attempt for identifier: {identifier} from IP: {client_ip}")
