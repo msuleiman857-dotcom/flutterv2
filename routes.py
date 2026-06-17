@@ -1187,6 +1187,42 @@ def get_conversations(user_id):
         logging.error(f"Get conversations error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
 
+@app.route('/api/user_profile/<string:user_id>', methods=['GET'])
+@jwt_required()
+def get_user_profile(user_id):
+    """Returns username, kyc, and profile_pic_url for the logged-in user."""
+    if str(user_id) != get_jwt_identity():
+        return jsonify({"status": "error", "message": "Unauthorized action"}), 403
+
+    try:
+        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+        }
+        params = {
+            "id": f"eq.{user_id}",
+            "select": "username,kyc,profile_pic_url"
+        }
+
+        response = requests.get(url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            if not data:
+                return jsonify({"status": "error", "message": "User not found"}), 404
+            return jsonify({
+                "status": "success",
+                "success": True,
+                "data": data[0]
+            }), 200
+        else:
+            logging.error(f"Supabase get user profile error: {response.text}")
+            return jsonify({"status": "error", "message": "Internal server error"}), 500
+    except Exception as e:
+        logging.error(f"get_user_profile error: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
 @app.route('/api/get-upload-url', methods=['POST'])
 @jwt_required()
 def get_upload_url():
