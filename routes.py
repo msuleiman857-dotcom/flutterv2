@@ -86,6 +86,46 @@ def handle_disconnect():
             print(f"User {uid} disconnected.")
             break
 
+@app.route('/api/upload-profile-pic', methods=['POST'])
+@jwt_required()
+def upload_profile_pic():
+    user_id = get_jwt_identity()
+
+    try:
+        file = request.files.get('file')
+        mime_type = request.form.get('mime_type', 'image/jpeg')
+        if not file:
+            return jsonify({'success': False, 'message': 'No file provided'}), 400
+
+        # Always saved as profile.jpg so each user has exactly one
+        # profile picture file, overwritten on every new upload.
+        storage_path = f"profile/{user_id}/profile.jpg"
+        url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/meetup/{storage_path}"
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+            "Content-Type": mime_type,
+            "x-upsert": "true",
+        }
+
+        file_bytes = file.read()
+        response = requests.post(url, headers=headers, data=file_bytes)
+
+        if response.status_code in (200, 201):
+            # Cache-bust so the new image shows immediately instead of
+            # browsers/clients serving a stale cached copy of profile.jpg
+            public_url = (
+                f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/meetup/{storage_path}"
+                f"?t={int(time.time())}"
+            )
+            return jsonify({'success': True, 'public_url': public_url}), 200
+        else:
+            logging.error(f"Supabase profile pic upload error: {response.text}")
+            return jsonify({'success': False, 'message': 'Upload to storage failed'}), 500
+    except Exception as e:
+        logging.error(f"upload_profile_pic error: {e}")
+        return jsonify({'success': False, 'message': 'Internal server error'}), 500
+
 @app.route('/api/upload-media', methods=['POST'])
 @jwt_required()
 def upload_media():
