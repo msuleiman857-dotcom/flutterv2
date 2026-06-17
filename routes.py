@@ -38,11 +38,14 @@ FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "firebase", "firebase-key.json")
 
 if not firebase_admin._apps:
     try:
-        cred = credentials.Certificate(FIREBASE_KEY_PATH)
-        firebase_admin.initialize_app(cred)
-        print("🔥 Firebase initialized successfully!")
+        if FIREBASE_KEY_PATH and os.path.exists(FIREBASE_KEY_PATH):
+            cred = credentials.Certificate(FIREBASE_KEY_PATH)
+            firebase_admin.initialize_app(cred)
+            print("🔥 Firebase initialized successfully!")
+        else:
+            print("⚠️ Firebase init failed: Path not found or not set in .env")
     except Exception as e:
-        print(f"⚠️ Firebase initialization failed: {e}")
+        print(f"⚠️ Firebase init failed (Check your JSON file): {e}")
 
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
@@ -66,16 +69,6 @@ limiter = Limiter(
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - SECURITY - %(levelname)s - %(message)s')
-
-try:
-    if FIREBASE_KEY_PATH and os.path.exists(FIREBASE_KEY_PATH):
-        cred = credentials.Certificate(FIREBASE_KEY_PATH)
-        firebase_admin.initialize_app(cred)
-        print("🔥 Firebase Admin initialized successfully!")
-    else:
-        print("⚠️ Firebase init failed: Path not found or not set in .env")
-except Exception as e:
-    print(f"⚠️ Firebase init failed (Check your JSON file): {e}")
 
 @socketio.on('connect')
 def handle_connect():
