@@ -378,6 +378,88 @@ def supabase_likes_webhook():
         print(f"CRITICAL WEBHOOK EXCEPTION: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route('/api/verify_kyc', methods=['POST'])
+@jwt_required()
+@limiter.limit("1 per hour")
+def verify_kyc():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+
+    nin_id = data.get('nin')
+    first_name = data.get('first_name')
+    last_name = data.get('last_name')
+    dob = data.get('date_of_birth')
+    selfie_base64 = data.get('selfie')  # already prefixed "data:image/jpeg;base64,..."
+
+    if not all([nin_id, first_name, last_name, dob, selfie_base64]):
+        return jsonify({"status": "error", "message": "Missing required fields"}), 400
+
+    try:
+        payload = {
+            "id": nin_id,
+            "verification_consent": True,
+            "validation": {
+                "first_name": first_name,
+                "last_name": last_name,
+                "date_of_birth": dob,
+                "selfie": selfie_base64
+            }
+        }
+        headers = {
+            "Authorization": f"Bearer {os.getenv('KORAPAY_SECRET_KEY')}",
+            "Content-Type": "application/json"
+        }
+
+        response = requests.post(
+            "https://api.korapay.com/merchant/api/v1/identities/ng/nin",
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+        result = response.json()
+
+        if response.status_code != 200 or not result.get('status'):
+            logging.error(f"Korapay verification failed for user {user_id}: {result}")
+            return jsonify({"status": "error", "message": "Verification failed. Please check your details and try again."}), 400
+
+        validation = result.get('data', {}).get('validation', {})
+        first_name_match = validation.get('first_name', {}).get('match', False)
+        last_name_match = validation.get('last_name', {}).get('match', False)
+        dob_match = validation.get('date_of_birth', {}).get('match', False)
+        selfie_confidence = validation.get('selfie', {}).get('confidence_rating', 0)
+
+        if not (first_name_match and last_name_match and dob_match and selfie_confidence >= 90):
+            logging.warning(f"KYC failed strict checks for user {user_id}: name={first_name_match}/{last_name_match}, dob={dob_match}, confidence={selfie_confidence}")
+            return jsonify({"status": "error", "message": "Identity verification did not pass. Please try again in 1 hour."}), 400
+
+        # Update kyc — this triggers your existing Supabase webhook,
+        # which broadcasts user_kyc_verified over the socket automatically.
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        update_headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json"
+        }
+        update_response = requests.patch(
+            f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
+            headers=update_headers,
+            json={"kyc": True}
+        )
+
+        if update_response.status_code not in (200, 204):
+            logging.error(f"Failed to update kyc for user {user_id}: {update_response.text}")
+            return jsonify({"status": "error", "message": "Verification succeeded but failed to save. Contact support."}), 500
+
+        return jsonify({"status": "success", "success": True, "message": "Identity verified successfully"}), 200
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Korapay request error for user {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Verification service unavailable. Please try again in 1 hour."}), 503
+    except Exception as e:
+        logging.error(f"verify_kyc unexpected error for user {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
 @app.route('/api/webhook/kyc_status', methods=['POST'])
 def kyc_status_webhook():
     data = request.get_json()
