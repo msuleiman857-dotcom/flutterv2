@@ -1457,7 +1457,6 @@ def api_send_message():
     if str(sender_id) != str(get_jwt_identity()):
         return jsonify({"status": "error", "message": "Unauthorized action"}), 403
 
-    # Clean up the reply ID logic
     if not reply_to_msg_id or str(reply_to_msg_id).lower() == 'null':
         reply_to_msg_id = None
     else:
@@ -1473,15 +1472,14 @@ def api_send_message():
     if message_content and fernet:
         encrypted_content = fernet.encrypt(message_content.encode()).decode()
 
-    # ---- Insert the message via RPC ----
     try:
+        # ---- Insert message via RPC ----
         url = f"{os.getenv('SUPABASE_URL')}/rest/v1/rpc/send_message_and_get_meta"
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
             "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
             "Content-Type": "application/json"
         }
-
         payload = {
             "p_sender_id": sender_id,
             "p_receiver_id": receiver_id,
@@ -1489,7 +1487,6 @@ def api_send_message():
             "p_media_content": media_content,
             "p_reply_to_msg_id": reply_to_msg_id
         }
-
         response = requests.post(url, headers=headers, json=payload)
 
         if response.status_code != 200:
@@ -1501,59 +1498,71 @@ def api_send_message():
         sender_name = db_data.get('sender_name', 'Someone')
         target_token = db_data.get('fcm_token')
 
-        # ---- 🔍 Fetch the real message ID (the one just inserted) ----
+        # ---- Fetch sender profile pic (used in socket + push) ----
+        sender_pic_url = None
+        try:
+            pic_res = requests.get(
+                f"{os.getenv('SUPABASE_URL')}/rest/v1/users",
+                headers={
+                    "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+                    "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+                },
+                params={"id": f"eq.{sender_id}", "select": "profile_pic_url"}
+            )
+            if pic_res.status_code == 200 and pic_res.json():
+                sender_pic_url = pic_res.json()[0].get('profile_pic_url')
+        except Exception as pic_err:
+            logging.warning(f"Could not fetch sender pic: {pic_err}")
+
+        # ---- Fetch real message ID ----
         message_id = None
         try:
-            url_msg = f"{os.getenv('SUPABASE_URL')}/rest/v1/messages"
-            headers_msg = {
-                "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-                "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
-            }
-            params_msg = {
-                "sender_id": f"eq.{sender_id}",
-                "receiver_id": f"eq.{receiver_id}",
-                "order": "sent_at.desc",
-                "limit": "1",
-                "select": "id"
-            }
-            msg_res = requests.get(url_msg, headers=headers_msg, params=params_msg)
-            if msg_res.status_code == 200:
-                msg_data = msg_res.json()
-                if msg_data and len(msg_data) > 0:
-                    message_id = msg_data[0].get('id')
+            msg_res = requests.get(
+                f"{os.getenv('SUPABASE_URL')}/rest/v1/messages",
+                headers={
+                    "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+                    "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+                },
+                params={
+                    "sender_id": f"eq.{sender_id}",
+                    "receiver_id": f"eq.{receiver_id}",
+                    "order": "sent_at.desc",
+                    "limit": "1",
+                    "select": "id"
+                }
+            )
+            if msg_res.status_code == 200 and msg_res.json():
+                message_id = msg_res.json()[0].get('id')
         except Exception as e:
             logging.error(f"Failed to fetch new message ID: {e}")
 
-        # ---- WebSocket delivery (if receiver is online) ----
+        # ---- WebSocket delivery ----
         receiver_id_str = str(receiver_id)
-
         if receiver_id_str in active_users:
             try:
-                receiver_sid = active_users[receiver_id_str]
-                socket_payload = {
-                    "id": message_id,                     # ✅ Added real ID
+                socketio.emit('receive_message', {
+                    "id": message_id,
                     "sender_id": str(sender_id),
                     "sender_name": sender_name,
+                    "sender_pic_url": sender_pic_url or "",
                     "message": message_content,
                     "media_content": media_content,
                     "reply_to_msg_id": reply_to_msg_id,
                     "is_stealth": is_stealth
-                }
-                socketio.emit('receive_message', socket_payload, to=receiver_sid)
+                }, to=active_users[receiver_id_str])
 
-                # Also notify the sender with the same payload (or just the ID)
                 sender_sid = active_users.get(str(sender_id))
                 if sender_sid:
                     socketio.emit('message_sent_success', {
-                        "id": message_id                 # Sender only needs the ID
+                        "id": message_id
                     }, to=sender_sid)
 
                 print(f"Message delivered via WebSocket to {receiver_id}")
             except Exception as e:
                 logging.error(f"WebSocket delivery failed: {e}")
 
-        elif target_token:
-            # Offline: Firebase push
+        # ---- Push notification (always fires if token exists) ----
+        if target_token:
             try:
                 if is_stealth:
                     display_body = "🕶️ Ultra Stealth Message received"
@@ -1562,28 +1571,37 @@ def api_send_message():
                     if reply_to_msg_id:
                         display_body = f"↩️ Replying: {display_body}"
 
-                push_msg = messaging.Message(
+                messaging.send(messaging.Message(
                     notification=messaging.Notification(
                         title=f"New message from {sender_name}",
-                        body=display_body
+                        body=display_body,
+                        image=sender_pic_url or None,
+                    ),
+                    android=messaging.AndroidConfig(
+                        priority='high',
+                        notification=messaging.AndroidNotification(
+                            image=sender_pic_url or None,
+                            priority='high',
+                            channel_id='chat_messages',
+                        ),
                     ),
                     data={
                         "type": "chat_message",
                         "sender_id": str(sender_id),
+                        "sender_name": sender_name,
+                        "sender_pic_url": sender_pic_url or "",
                         "is_stealth": "true" if is_stealth else "false"
                     },
                     token=target_token,
-                )
-                messaging.send(push_msg)
+                ))
             except Exception as e:
-                logging.error(f"Firebase error: {e}")
+                logging.error(f"Firebase push error: {e}")
 
-        # ---- Final HTTP response with the real ID ----
         return jsonify({
             "status": "success",
             "message": "Message sent",
             "is_stealth": is_stealth,
-            "message_id": message_id        # Now it's the real ID
+            "message_id": message_id
         }), 201
 
     except Exception as e:
