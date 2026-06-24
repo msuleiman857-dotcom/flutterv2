@@ -1,5 +1,6 @@
 import os
 import time
+import math
 os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
 
 import eventlet
@@ -164,6 +165,83 @@ def upload_media():
     except Exception as e:
         logging.error(f"upload_media error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Straight-line distance in km between two lat/lng points."""
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+
+@app.route('/api/payment/accept', methods=['POST'])
+@jwt_required()
+def accept_payment_bubble():
+    """
+    Called when the receiver taps 'Accept' on a payment bubble.
+    Does NOT move funds or change payment status yet (that's later).
+    Just resolves both users' last-known location and returns distance,
+    so the UI can show e.g. 'Tobi is 2.3km away'.
+    """
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json(silent=True) or {}
+        reference = data.get('reference')
+        if not reference:
+            return jsonify({"status": "error", "message": "Missing reference"}), 400
+
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+
+        pay_res = requests.get(
+            f"{supabase_url}/rest/v1/payments?reference=eq.{reference}&select=payer_id,recipient_id,amount,status",
+            headers=headers
+        )
+        if pay_res.status_code != 200 or not pay_res.json():
+            return jsonify({"status": "error", "message": "Payment not found"}), 404
+
+        payment = pay_res.json()[0]
+
+        # Only payer or recipient may resolve this
+        if user_id not in (str(payment['payer_id']), str(payment['recipient_id'])):
+            return jsonify({"status": "error", "message": "Unauthorized"}), 403
+
+        other_id = payment['recipient_id'] if str(payment['payer_id']) == user_id else payment['payer_id']
+
+        users_res = requests.get(
+            f"{supabase_url}/rest/v1/users?id=in.({user_id},{other_id})&select=id,latitude,longitude,username"
+        , headers=headers)
+
+        if users_res.status_code != 200:
+            return jsonify({"status": "error", "message": "Could not resolve location"}), 500
+
+        rows = {str(r['id']): r for r in users_res.json()}
+        me = rows.get(str(user_id))
+        other = rows.get(str(other_id))
+
+        if not me or not other or me.get('latitude') is None or other.get('latitude') is None:
+            return jsonify({"status": "success", "distance_km": None, "message": "Location unavailable"}), 200
+
+        distance_km = _haversine_km(
+            float(me['latitude']), float(me['longitude']),
+            float(other['latitude']), float(other['longitude'])
+        )
+
+        return jsonify({
+            "status": "success",
+            "distance_km": round(distance_km, 1),
+            "other_username": other.get('username', 'User')
+        }), 200
+
+    except Exception as e:
+        logging.error(f"accept_payment_bubble error: {e}")
+        return jsonify({"status": "error", "message": "Internal error"}), 500
 
 @socketio.on('profile_pic_updated')
 def handle_profile_pic_updated(data):
