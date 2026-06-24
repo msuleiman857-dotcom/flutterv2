@@ -1480,6 +1480,50 @@ def get_private_messages(user_id, other_id):
                 except:
                     pass
 
+        # ---- Pull payment history between these two users from `payments` ----
+        # Plain REST query against the payments table (same pattern as
+        # initiate_payout / check_payment elsewhere in this file).
+        # No RPC editing needed — payments is a normal Supabase table.
+        try:
+            pay_headers = {
+                "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+                "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+            }
+            pay_res = requests.get(
+                f"{os.getenv('SUPABASE_URL')}/rest/v1/payments",
+                headers=pay_headers,
+                params={
+                    "or": f"(and(payer_id.eq.{user_id},recipient_id.eq.{other_id}),and(payer_id.eq.{other_id},recipient_id.eq.{user_id}))",
+                    "select": "id,reference,payer_id,recipient_id,amount,status,created_at",
+                    "order": "created_at.asc"
+                }
+            )
+            if pay_res.status_code == 200:
+                for p in pay_res.json():
+                    sent_at = p.get('created_at')
+                    if sent_at:
+                        try:
+                            sent_at = parse_supabase_ts(sent_at).strftime('%Y-%m-%d %H:%M:%S')
+                        except Exception:
+                            pass
+                    messages.append({
+                        "id": f"payment_{p['reference']}",
+                        "type": "payment",
+                        "sender_id": str(p['payer_id']),
+                        "reference": p['reference'],
+                        "amount": p['amount'],
+                        "status": p['status'],
+                        "sent_at": sent_at,
+                        "is_read": True,
+                    })
+            else:
+                logging.error(f"Failed to fetch payments for chat: {pay_res.text}")
+        except Exception as pay_err:
+            logging.error(f"Payment history merge error: {pay_err}")
+
+        # Re-sort everything chronologically now that payments are mixed in
+        messages.sort(key=lambda m: m.get('sent_at') or '')
+
         # Return the perfectly formatted payload to Flutter
         return jsonify({
             "status": "success",
