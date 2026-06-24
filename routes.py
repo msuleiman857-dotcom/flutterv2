@@ -128,6 +128,42 @@ def upload_profile_pic():
         logging.error(f"upload_profile_pic error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
 
+@app.route('/api/payout/cancel', methods=['POST'])
+@jwt_required()
+def cancel_payout():
+    """Destroys the pending payment row when the user backs out."""
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json(silent=True) or {}
+        reference = data.get('reference')
+        
+        if not reference:
+            return jsonify({"status": "error", "message": "Reference required"}), 400
+
+        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/payments"
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
+        }
+        # Only delete if it's pending, belongs to this user, and matches the reference
+        params = {
+            "reference": f"eq.{reference}",
+            "payer_id": f"eq.{user_id}",
+            "status": "eq.pending"
+        }
+        
+        res = requests.delete(url, headers=headers, params=params)
+        
+        if res.status_code in (200, 204):
+            return jsonify({"status": "success", "message": "Payment row destroyed"}), 200
+        else:
+            logging.error(f"Failed to delete payment: {res.text}")
+            return jsonify({"status": "error", "message": "Failed to delete"}), 500
+
+    except Exception as e:
+        logging.error(f"Cancel payout error: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
 @app.route('/api/upload-media', methods=['POST'])
 @jwt_required()
 def upload_media():
