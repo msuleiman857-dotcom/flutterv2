@@ -170,18 +170,16 @@ def resolve_bank_account():
     try:
         data = request.get_json(silent=True) or {}
         account_number = data.get('account_number')
-        bank_code = data.get('bank_code') # Sent directly from Flutter drop-down selection
+        bank_code = data.get('bank_code')
 
         if not account_number or len(str(account_number).strip()) < 10:
-            return jsonify({"status": "error", "message": "Valid 10-digit account number is required"}), 400
+            return jsonify({"status": "error", "success": False, "message": "Valid 10-digit account number is required"}), 400
             
         if not bank_code:
-            return jsonify({"status": "error", "message": "Bank institution code selection is required"}), 400
+            return jsonify({"status": "error", "success": False, "message": "Bank institution code selection is required"}), 400
 
-        # Look up the bank name from your local NIGERIAN_BANKS dictionary
         bank_name = NIGERIAN_BANKS.get(str(bank_code), "Unknown Bank")
 
-        # Create Korapay API request parameters
         url = "https://api.korapay.com/v1/merchant/bank-account-verification"
         headers = {
             "Authorization": f"Bearer {os.getenv('KORAPAY_SECRET_KEY')}",
@@ -194,29 +192,34 @@ def resolve_bank_account():
 
         logging.info(f"Direct high-speed verification hit for {bank_name} ({bank_code}) - Acct: {account_number}")
         
-        # Hit Korapay exactly ONCE. No threading, no loops.
         response = requests.post(url, headers=headers, json=payload, timeout=10)
 
-        if response.status_code == 200:
-            res_json = response.json()
-            if res_json.get("status") is True and "data" in res_json:
-                account_name = res_json["data"].get("account_name")
-                if account_name:
-                    return jsonify({
-                        "status": "success",
-                        "success": True,
-                        "account_name": account_name
-                    }), 200
+        # 🌟 BULLETPROOF FIX: Check if response has content and status code is 200
+        if response.status_code == 200 and response.text:
+            try:
+                res_json = response.json()
+                if res_json.get("status") is True and "data" in res_json:
+                    account_name = res_json["data"].get("account_name")
+                    if account_name:
+                        return jsonify({
+                            "status": "success",
+                            "success": True,
+                            "account_name": account_name
+                        }), 200
+            except json.JSONDecodeError:
+                logging.error(f"Korapay sent back malformed JSON despite 200 status code: {response.text}")
 
-        # Handle failed lookups smoothly
+        # 🌟 LOG THE EXACT REJECTION REASON: Now you can see what Korapay is saying!
+        logging.warning(f"Korapay API Refusal (Status {response.status_code}): {response.text}")
+
         return jsonify({
             "status": "error",
             "success": False,
-            "message": f"Could not verify account details with {bank_name}. Please check the credentials."
+            "message": f"Could not verify account details with {bank_name}. Please confirm credentials."
         }), 404
 
     except Exception as e:
-        logging.error(f"High-speed account resolution crash: {e}")
+        logging.error(f"High-speed account resolution crash caught safely: {e}")
         return jsonify({"status": "error", "success": False, "message": "Internal verification error occurred"}), 500
 
 @app.route('/api/payout/save-link', methods=['POST'])
