@@ -170,38 +170,54 @@ def resolve_bank_account():
     try:
         data = request.get_json(silent=True) or {}
         account_number = data.get('account_number')
+        bank_code = data.get('bank_code') # Sent directly from Flutter drop-down selection
 
         if not account_number or len(str(account_number).strip()) < 10:
-            return jsonify({"status": "error", "message": "Valid account number is required"}), 400
+            return jsonify({"status": "error", "message": "Valid 10-digit account number is required"}), 400
+            
+        if not bank_code:
+            return jsonify({"status": "error", "message": "Bank institution code selection is required"}), 400
 
+        # Look up the bank name from your local NIGERIAN_BANKS dictionary
+        bank_name = NIGERIAN_BANKS.get(str(bank_code), "Unknown Bank")
+
+        # Create Korapay API request parameters
+        url = "https://api.korapay.com/v1/merchant/bank-account-verification"
         headers = {
             "Authorization": f"Bearer {os.getenv('KORAPAY_SECRET_KEY')}",
             "Content-Type": "application/json"
         }
+        payload = {
+            "account_number": str(account_number).strip(),
+            "bank_code": str(bank_code).strip()
+        }
 
-        matches = []
-        # Max workers capped at 30 to optimize concurrent execution without overwhelming platform threads
-        with ThreadPoolExecutor(max_workers=30) as executor:
-            futures = [
-                executor.submit(_check_single_bank, code, name, str(account_number).strip(), headers)
-                for code, name in NIGERIAN_BANKS.items()
-            ]
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    matches.append(result)
+        logging.info(f"Direct high-speed verification hit for {bank_name} ({bank_code}) - Acct: {account_number}")
+        
+        # Hit Korapay exactly ONCE. No threading, no loops.
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
 
-        if not matches:
-            return jsonify({"status": "error", "message": "Could not resolve account details across known banks"}), 404
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get("status") is True and "data" in res_json:
+                account_name = res_json["data"].get("account_name")
+                if account_name:
+                    return jsonify({
+                        "status": "success",
+                        "success": True,
+                        "account_name": account_name
+                    }), 200
 
+        # Handle failed lookups smoothly
         return jsonify({
-            "status": "success",
-            "matches": matches
-        }), 200
+            "status": "error",
+            "success": False,
+            "message": f"Could not verify account details with {bank_name}. Please check the credentials."
+        }), 404
 
     except Exception as e:
-        logging.error(f"Account resolution crash: {e}")
-        return jsonify({"status": "error", "message": "Internal verification error occurred"}), 500
+        logging.error(f"High-speed account resolution crash: {e}")
+        return jsonify({"status": "error", "success": False, "message": "Internal verification error occurred"}), 500
 
 @app.route('/api/payout/save-link', methods=['POST'])
 @jwt_required()
