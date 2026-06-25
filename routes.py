@@ -221,14 +221,15 @@ def save_bank_link():
             return jsonify({"success": False, "message": "Missing required linkage fields"}), 400
 
         # ✨ INSERT / UPDATE LINKED BANK IN SUPABASE VIA REST API
-        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/linked_bank"
+        # ✨ FIXED: Added '?on_conflict=owner_id' to target the unique column constraint for merging
+        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/linked_bank?on_conflict=owner_id"
+        
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
             "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
             "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates" # Upserts seamlessly if it already exists
+            "Prefer": "resolution=merge-duplicates" # Now it knows exactly what to merge on duplicate!
         }
-
         payload = {
             "owner_id": str(owner_id),
             "account_number": str(account_number),
