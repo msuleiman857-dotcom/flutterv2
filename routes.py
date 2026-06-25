@@ -203,6 +203,52 @@ def resolve_bank_account():
         logging.error(f"Account resolution crash: {e}")
         return jsonify({"status": "error", "message": "Internal verification error occurred"}), 500
 
+@app.route('/api/payout/save-link', methods=['POST'])
+@jwt_required()
+def save_bank_link():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "message": "Missing request payload body"}), 400
+            
+        owner_id = data.get('owner_id')
+        account_number = data.get('account_number')
+        acct_name = data.get('acct_name')
+        bank_code = data.get('bank_code')
+        bank_name = data.get('bank_name')
+        
+        if not all([owner_id, account_number, acct_name, bank_code, bank_name]):
+            return jsonify({"success": False, "message": "Missing required linkage fields"}), 400
+
+        # ✨ INSERT / UPDATE LINKED BANK IN SUPABASE VIA REST API
+        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/linked_bank"
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates" # Upserts seamlessly if it already exists
+        }
+
+        payload = {
+            "owner_id": str(owner_id),
+            "account_number": str(account_number),
+            "acct_name": str(acct_name),
+            "bank_code": str(bank_code),
+            "bank_name": str(bank_name)
+        }
+
+        response = requests.post(url, headers=headers, json=payload)
+
+        if response.status_code in [200, 201]:
+            return jsonify({"success": True, "message": "Bank account linked successfully!"}), 200
+        else:
+            logging.error(f"Supabase error linking bank: {response.text}")
+            return jsonify({"success": False, "message": f"Database rejected linkage: {response.text}"}), 500
+
+    except Exception as e:
+        logging.error(f"Exception in save_bank_link: {str(e)}")
+        return jsonify({"success": False, "message": f"Internal server exception error: {str(e)}"}), 500
+
 @app.route('/api/payout/cancel', methods=['POST'])
 @jwt_required()
 def cancel_payout():
