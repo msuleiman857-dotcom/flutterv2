@@ -30,6 +30,24 @@ from security import (
     verify_bot_token, generate_pow_challenge, verify_pow, is_suspicious_request,
     dummy_verify, verify_password
 )
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+NIGERIAN_BANKS = {
+    "044": "Access Bank", "058": "GTBank", "033": "UBA", "057": "Zenith Bank", "011": "First Bank", 
+    "214": "FCMB", "070": "Fidelity Bank", "035": "Wema Bank", "050": "Ecobank", "232": "Sterling Bank", 
+    "076": "Polaris Bank", "032": "Union Bank", "221": "Stanbic IBTC", "305": "Opay", "50211": "Kuda Bank", 
+    "090405": "Moniepoint MFB", "100033": "PalmPay", "082": "Keystone Bank", "023": "CitiBank", 
+    "063": "Diamond Bank", "103": "Globus Bank", "107": "Optimus Bank", "104": "Parallex Bank", 
+    "301": "Jaiz Bank", "068": "Standard Chartered", "100": "SunTrust Bank", "215": "Unity Bank", 
+    "030": "Heritage Bank", "101": "Providus Bank", "102": "Titan Trust", "106": "Signature Bank", 
+    "108": "Premium Trust", "060": "Stanbic Mobile", "302": "TAJBank", "303": "Corona Merchant", 
+    "304": "FBNQuest Merchant", "307": "Lotus Bank", "309": "Nova Merchant", "090110": "VFD MFB (Vbank)", 
+    "090175": "Rubies Bank", "090267": "Kredi Money MFB", "090408": "Gromicro MFB", "090550": "Carbon", 
+    "090156": "FairMoney MFB", "50515": "Baxi", "100022": "GoMoney", "90115": "Taj Wallet", "565": "One MFB", 
+    "601": "Fina Trust MFB", "50259": "Sparkle MFB", "090133": "Alat by Wema", "090328": "Eyowo", 
+    "090281": "Mint Finex MFB", "090410": "Migo", "120001": "9PSB", "120002": "Hope PSB", 
+    "120003": "MTN MoMo PSB", "120004": "Airtel SmartCash PSB"
+}
 
 load_dotenv(os.path.expanduser("~/flas/.env"))
 
@@ -127,6 +145,63 @@ def upload_profile_pic():
     except Exception as e:
         logging.error(f"upload_profile_pic error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
+
+def _check_single_bank(bank_code, bank_name, account_number, headers):
+    """Silently hits Kora API to verify if account matches the specific bank."""
+    try:
+        url = "https://api.korapay.com/merchant/api/v1/misc/banks/resolve"
+        payload = {"bank": bank_code, "account": account_number, "currency": "NGN"}
+        res = requests.post(url, json=payload, headers=headers, timeout=4)
+        res_json = res.json()
+        
+        if res.status_code == 200 and res_json.get("status") is True:
+            return {
+                "bank_name": bank_name,
+                "bank_code": bank_code,
+                "account_name": res_json.get("data", {}).get("account_name")
+            }
+    except Exception:
+        pass
+    return None
+
+@app.route('/api/payout/resolve-account', methods=['POST'])
+@jwt_required()
+def resolve_bank_account():
+    try:
+        data = request.get_json(silent=True) or {}
+        account_number = data.get('account_number')
+
+        if not account_number or len(str(account_number).strip()) < 10:
+            return jsonify({"status": "error", "message": "Valid account number is required"}), 400
+
+        headers = {
+            "Authorization": f"Bearer {os.getenv('KORAPAY_SECRET_KEY')}",
+            "Content-Type": "application/json"
+        }
+
+        matches = []
+        # Max workers capped at 30 to optimize concurrent execution without overwhelming platform threads
+        with ThreadPoolExecutor(max_workers=30) as executor:
+            futures = [
+                executor.submit(_check_single_bank, code, name, str(account_number).strip(), headers)
+                for code, name in NIGERIAN_BANKS.items()
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    matches.append(result)
+
+        if not matches:
+            return jsonify({"status": "error", "message": "Could not resolve account details across known banks"}), 404
+
+        return jsonify({
+            "status": "success",
+            "matches": matches
+        }), 200
+
+    except Exception as e:
+        logging.error(f"Account resolution crash: {e}")
+        return jsonify({"status": "error", "message": "Internal verification error occurred"}), 500
 
 @app.route('/api/payout/cancel', methods=['POST'])
 @jwt_required()
