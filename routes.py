@@ -1152,29 +1152,33 @@ def api_login():
         # 5. FINAL DECISION
         if is_valid_login:
             access_token = create_access_token(identity=str(user['id']))
-            logging.info(f"Successful login for user ID: {user['id']}")
-
-            # ✨ NEW: UPDATE USER LOCATION IN SUPABASE POST-LOGIN ✨
-            # We target the row matching this specific user ID and PATCH the location column
+        
+            # ✅ FIX: Fetch linked bank at login and include in response
+            bank_no = None
+            bank_institution = None
             try:
-                update_url = f"{url}?id=eq.{user['id']}"
-                update_payload = {"latitude": user_latitude, "longitude": user_longitude}
-                
-                update_response = requests.patch(update_url, headers=headers, json=update_payload)
-                
-                if update_response.status_code not in [200, 204]:
-                    logging.error(f"Failed to update location in Supabase: {update_response.text}")
-                    # We do NOT crash the login flow here. If the location update fails for some reason, 
-                    # we still let the user log in successfully.
-            except Exception as loc_err:
-                logging.error(f"Error firing location sync to database: {loc_err}")
-
+                bank_res = requests.get(
+                    f"{url}".replace("/rest/v1/users", "") +  # reuse base URL cleanly
+                    # easier: just build it directly:
+                    f"{os.getenv('SUPABASE_URL')}/rest/v1/linked_bank",
+                    headers=headers,
+                    params={"owner_id": f"eq.{user['id']}", "select": "account_number,bank_name"}
+                )
+                if bank_res.status_code == 200 and bank_res.json():
+                    bank = bank_res.json()[0]
+                    bank_no = bank.get('account_number')
+                    bank_institution = bank.get('bank_name')
+            except Exception as bank_err:
+                logging.error(f"Bank fetch at login failed: {bank_err}")
+        
             return jsonify({
                 'status': 'success',
                 'username': user['username'],
                 'id': user['id'],
                 'access_token': access_token,
-                'kyc': user.get('kyc', False)
+                'kyc': user.get('kyc', False),
+                'bank_no': bank_no,               # ✅ NEW
+                'bank_institution': bank_institution  # ✅ NEW
             }), 200
         else:
             logging.warning(f"Failed login attempt for identifier: {identifier} from IP: {client_ip}")
