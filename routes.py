@@ -317,6 +317,72 @@ def save_bank_link():
         logging.error(f"Exception in save_bank_link: {str(e)}")
         return jsonify({"success": False, "message": f"Internal server exception error: {str(e)}"}), 500
 
+@app.route('/api/update_location', methods=['POST'])
+@jwt_required()
+def update_location():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json(silent=True) or {}
+        lat = data.get('latitude')
+        lng = data.get('longitude')
+
+        if lat is None or lng is None:
+            return jsonify({"success": False, "message": "Missing coordinates"}), 400
+
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json"
+        }
+
+        res = requests.patch(
+            f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
+            headers=headers,
+            json={"latitude": lat, "longitude": lng}
+        )
+
+        if res.status_code in (200, 204):
+            return jsonify({"success": True}), 200
+        else:
+            return jsonify({"success": False}), 500
+
+    except Exception as e:
+        logging.error(f"update_location error: {e}")
+        return jsonify({"success": False}), 500
+
+@app.route('/api/user_location/<string:user_id>', methods=['GET'])
+@jwt_required()
+def get_user_location(user_id):
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+
+        res = requests.get(
+            f"{supabase_url}/rest/v1/users",
+            headers=headers,
+            params={"id": f"eq.{user_id}", "select": "latitude,longitude"}
+        )
+
+        if res.status_code == 200 and res.json():
+            row = res.json()[0]
+            return jsonify({
+                "success": True,
+                "latitude": row.get("latitude"),
+                "longitude": row.get("longitude")
+            }), 200
+
+        return jsonify({"success": False, "message": "User not found"}), 404
+
+    except Exception as e:
+        logging.error(f"get_user_location error: {e}")
+        return jsonify({"success": False}), 500
+
 @app.route('/api/payout/cancel', methods=['POST'])
 @jwt_required()
 def cancel_payout():
