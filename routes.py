@@ -146,6 +146,51 @@ def upload_profile_pic():
         logging.error(f"upload_profile_pic error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
 
+@app.route('/api/user_profile/<string:user_id>', methods=['GET'])
+@jwt_required()
+def get_user_profile(user_id):
+    if str(user_id) != get_jwt_identity():
+        return jsonify({"status": "error", "message": "Unauthorized action"}), 403
+
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+
+        # Fetch user fields
+        user_res = requests.get(
+            f"{supabase_url}/rest/v1/users",
+            headers=headers,
+            params={"id": f"eq.{user_id}", "select": "username,kyc,profile_pic_url"}
+        )
+        if user_res.status_code != 200 or not user_res.json():
+            return jsonify({"status": "error", "message": "User not found"}), 404
+
+        data = user_res.json()[0]
+
+        # ✅ FIX: Also fetch linked bank details
+        bank_res = requests.get(
+            f"{supabase_url}/rest/v1/linked_bank",
+            headers=headers,
+            params={"owner_id": f"eq.{user_id}", "select": "account_number,bank_name"}
+        )
+        if bank_res.status_code == 200 and bank_res.json():
+            bank = bank_res.json()[0]
+            data['bank_no'] = bank.get('account_number')
+            data['bank_institution'] = bank.get('bank_name')
+        else:
+            data['bank_no'] = None
+            data['bank_institution'] = None
+
+        return jsonify({"status": "success", "success": True, "data": data}), 200
+
+    except Exception as e:
+        logging.error(f"get_user_profile error: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
 def _check_single_bank(bank_code, bank_name, account_number, headers):
     """Silently hits Kora API to verify if account matches the specific bank."""
     try:
