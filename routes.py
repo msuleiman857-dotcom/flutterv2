@@ -404,16 +404,13 @@ def _haversine_km(lat1, lon1, lat2, lon2):
 @app.route('/api/payment/accept', methods=['POST'])
 @jwt_required()
 def accept_payment_bubble():
-    """
-    Called when the receiver taps 'Accept' on a payment bubble.
-    Does NOT move funds or change payment status yet (that's later).
-    Just resolves both users' last-known location and returns distance,
-    so the UI can show e.g. 'Tobi is 2.3km away'.
-    """
     try:
-        user_id = get_jwt_identity()
+        user_id = get_jwt_identity()  # This is the receiver
         data = request.get_json(silent=True) or {}
         reference = data.get('reference')
+        receiver_lat = data.get('receiver_lat')
+        receiver_lng = data.get('receiver_lng')
+
         if not reference:
             return jsonify({"status": "error", "message": "Missing reference"}), 400
 
@@ -424,6 +421,7 @@ def accept_payment_bubble():
             "Authorization": f"Bearer {supabase_key}"
         }
 
+        # Fetch payment row to get payer_id
         pay_res = requests.get(
             f"{supabase_url}/rest/v1/payments?reference=eq.{reference}&select=payer_id,recipient_id,amount,status",
             headers=headers
@@ -432,41 +430,87 @@ def accept_payment_bubble():
             return jsonify({"status": "error", "message": "Payment not found"}), 404
 
         payment = pay_res.json()[0]
+        payer_id = str(payment['payer_id'])
+        recipient_id = str(payment['recipient_id'])
 
-        # Only payer or recipient may resolve this
-        if user_id not in (str(payment['payer_id']), str(payment['recipient_id'])):
+        # Security: only the recipient can accept
+        if user_id != recipient_id:
             return jsonify({"status": "error", "message": "Unauthorized"}), 403
 
-        other_id = payment['recipient_id'] if str(payment['payer_id']) == user_id else payment['payer_id']
+        distance_km = None
 
-        users_res = requests.get(
-            f"{supabase_url}/rest/v1/users?id=in.({user_id},{other_id})&select=id,latitude,longitude,username"
-        , headers=headers)
+        if receiver_lat is not None and receiver_lng is not None:
+            # Fetch only the sender's stored coords
+            sender_res = requests.get(
+                f"{supabase_url}/rest/v1/users?id=eq.{payer_id}&select=latitude,longitude,username",
+                headers=headers
+            )
+            if sender_res.status_code == 200 and sender_res.json():
+                sender = sender_res.json()[0]
+                if sender.get('latitude') is not None and sender.get('longitude') is not None:
+                    distance_km = round(_haversine_km(
+                        float(receiver_lat), float(receiver_lng),
+                        float(sender['latitude']), float(sender['longitude'])
+                    ), 1)
 
-        if users_res.status_code != 200:
-            return jsonify({"status": "error", "message": "Could not resolve location"}), 500
-
-        rows = {str(r['id']): r for r in users_res.json()}
-        me = rows.get(str(user_id))
-        other = rows.get(str(other_id))
-
-        if not me or not other or me.get('latitude') is None or other.get('latitude') is None:
-            return jsonify({"status": "success", "distance_km": None, "message": "Location unavailable"}), 200
-
-        distance_km = _haversine_km(
-            float(me['latitude']), float(me['longitude']),
-            float(other['latitude']), float(other['longitude'])
-        )
+        # Emit distance event ONLY to the sender's socket room
+        if payer_id in active_users:
+            socketio.emit('payment_accepted', {
+                'reference': reference,
+                'distance_km': distance_km,
+                'receiver_id': recipient_id,
+            }, room=active_users[payer_id])
+            logging.info(f"payment_accepted emitted to sender {payer_id}, distance={distance_km}km")
 
         return jsonify({
             "status": "success",
-            "distance_km": round(distance_km, 1),
-            "other_username": other.get('username', 'User')
+            "distance_km": distance_km,
         }), 200
 
     except Exception as e:
         logging.error(f"accept_payment_bubble error: {e}")
         return jsonify({"status": "error", "message": "Internal error"}), 500
+
+@app.route('/api/payments/exists', methods=['GET'])
+@jwt_required()
+def payment_exists():
+    """Returns whether a success payment exists between two users."""
+    try:
+        user_id = get_jwt_identity()
+        other_id = request.args.get('other_id')
+
+        if not other_id:
+            return jsonify({"exists": False}), 400
+
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+
+        res = requests.get(
+            f"{supabase_url}/rest/v1/payments",
+            headers=headers,
+            params={
+                "or": f"(and(payer_id.eq.{user_id},recipient_id.eq.{other_id}),and(payer_id.eq.{other_id},recipient_id.eq.{user_id}))",
+                "status": "eq.success",
+                "select": "id,payer_id",
+                "limit": "1"
+            }
+        )
+
+        if res.status_code == 200 and res.json():
+            row = res.json()[0]
+            # is_payer tells Flutter whether to show Release Funds
+            is_payer = str(row['payer_id']) == str(user_id)
+            return jsonify({"exists": True, "is_payer": is_payer}), 200
+
+        return jsonify({"exists": False, "is_payer": False}), 200
+
+    except Exception as e:
+        logging.error(f"payment_exists error: {e}")
+        return jsonify({"exists": False, "is_payer": False}), 500
 
 @socketio.on('profile_pic_updated')
 def handle_profile_pic_updated(data):
