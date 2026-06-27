@@ -1975,6 +1975,7 @@ def get_private_messages(user_id, other_id):
                         "reference": p['reference'],
                         "amount": p['amount'],
                         "status": p['status'],
+                        "concluded": p.get('concluded', False), 
                         "sent_at": sent_at,
                         "is_read": True,
                     })
