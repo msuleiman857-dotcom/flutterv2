@@ -171,6 +171,7 @@ def payment_exists():
                 "status": "eq.success",
                 "concluded": "eq.false",        # ← only unreleased payments
                 "select": "id,payer_id,reference",  # ← add reference here
+                "order": "created_at.desc", 
                 "limit": "1"
             }
         )
