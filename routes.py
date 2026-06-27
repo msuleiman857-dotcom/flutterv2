@@ -1956,7 +1956,7 @@ def get_private_messages(user_id, other_id):
                 headers=pay_headers,
                 params={
                     "or": f"(and(payer_id.eq.{user_id},recipient_id.eq.{other_id}),and(payer_id.eq.{other_id},recipient_id.eq.{user_id}))",
-                    "select": "id,reference,payer_id,recipient_id,amount,status,created_at",
+                    "select": "id,reference,payer_id,recipient_id,amount,status,concluded,created_at",
                     "order": "created_at.asc"
                 }
             )
