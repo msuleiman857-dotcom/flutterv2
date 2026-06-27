@@ -1178,6 +1178,7 @@ def initiate_payout():
                     "payer_id": str(user_id),
                     "recipient_id": str(recipient_id),
                     "amount": amount,
+                    "concluded": False,
                     "status": "pending"
                 }
                 pay_res = requests.post(payments_url, headers=payment_headers, json=payment_payload)
