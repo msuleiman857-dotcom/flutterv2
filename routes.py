@@ -146,6 +146,165 @@ def upload_profile_pic():
         logging.error(f"upload_profile_pic error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
 
+@app.route("/api/payments/release", methods=["POST"])
+@jwt_required()
+def release_funds():
+    payer_id = get_jwt_identity()
+    data = request.get_json(silent=True) or {}
+    reference = data.get("reference")
+
+    if not reference:
+        return jsonify({"status": "error", "message": "Reference is required"}), 400
+
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
+    sb_headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # ── STEP 1: Fetch the payment row ──────────────────────────────────
+        pay_res = requests.get(
+            f"{supabase_url}/rest/v1/payments",
+            headers=sb_headers,
+            params={
+                "reference": f"eq.{reference}",
+                "select": "id,payer_id,recipient_id,amount,currency,status,concluded"
+            }
+        )
+        if pay_res.status_code != 200 or not pay_res.json():
+            return jsonify({"status": "error", "message": "Payment not found"}), 404
+
+        payment = pay_res.json()[0]
+
+        # ── STEP 2: Ownership check — JWT must be the payer ───────────────
+        if str(payment["payer_id"]) != str(payer_id):
+            logging.warning(f"Unauthorized release attempt: user {payer_id} on reference {reference}")
+            return jsonify({"status": "error", "message": "Unauthorized"}), 403
+
+        # ── STEP 3: Payment must be confirmed success ──────────────────────
+        if payment["status"] != "success":
+            return jsonify({"status": "error", "message": "Payment has not been confirmed yet"}), 400
+
+        # ── STEP 4: Block double release ───────────────────────────────────
+        if payment["concluded"] is True:
+            return jsonify({"status": "error", "message": "Funds have already been released"}), 409
+
+        # ── STEP 5: Fetch recipient bank details from linked_bank ──────────
+        recipient_id = str(payment["recipient_id"])
+        bank_res = requests.get(
+            f"{supabase_url}/rest/v1/linked_bank",
+            headers=sb_headers,
+            params={
+                "owner_id": f"eq.{recipient_id}",
+                "select": "account_number,acct_name,bank_code,bank_name"
+            }
+        )
+        if bank_res.status_code != 200 or not bank_res.json():
+            logging.error(f"No linked bank found for recipient {recipient_id}")
+            return jsonify({"status": "error", "message": "Recipient has no linked bank account"}), 422
+
+        bank = bank_res.json()[0]
+
+        # ── STEP 6: Call Kora to disburse ──────────────────────────────────
+        kora_base_url = os.getenv("KORA_GCP_BASE_URL")
+        kora_secret = os.getenv("KORAPAY_SECRET_KEY")
+
+        kora_headers = {
+            "Authorization": f"Bearer {kora_secret}",
+            "Content-Type": "application/json"
+        }
+        kora_payload = {
+            "reference": f"RELEASE-{reference}",
+            "destination": {
+                "type": "bank_account",
+                "amount": float(payment["amount"]),
+                "currency": payment.get("currency", "NGN"),
+                "narration": f"Meetup payout to {bank['acct_name']}",
+                "bank_account": {
+                    "bank": bank["bank_code"],
+                    "account": bank["account_number"]
+                },
+                "customer": {
+                    "name": bank["acct_name"],
+                    "email": f"{recipient_id}@internal.app"
+                }
+            }
+        }
+
+        kora_res = requests.post(
+            f"{kora_base_url}/merchant/api/v1/transactions/disburse",
+            json=kora_payload,
+            headers=kora_headers,
+            timeout=30
+        )
+
+        if kora_res.status_code not in (200, 201):
+            logging.error(f"Kora disburse failed [{kora_res.status_code}]: {kora_res.text}")
+            return jsonify({
+                "status": "error",
+                "message": "Payout to recipient failed",
+                "details": kora_res.json() if kora_res.content else {}
+            }), 502
+
+        # ── STEP 7: Flip concluded = true on payments row ──────────────────
+        patch_res = requests.patch(
+            f"{supabase_url}/rest/v1/payments",
+            headers=sb_headers,
+            params={
+                "reference": f"eq.{reference}",
+                "payer_id": f"eq.{payer_id}",  # extra safety filter
+                "concluded": "eq.false"          # idempotency guard at DB level
+            },
+            json={"concluded": True}
+        )
+        if patch_res.status_code not in (200, 204):
+            # Kora already sent money — log loudly for manual reconciliation
+            logging.error(f"CRITICAL: Kora paid out but concluded flag failed to set. Reference: {reference}")
+
+        # ── STEP 8: Insert into released_funds as audit proof ──────────────
+        audit_res = requests.post(
+            f"{supabase_url}/rest/v1/released_funds",
+            headers={**sb_headers, "Prefer": "return=representation"},
+            json={
+                "reference": reference,
+                "payer_id": payer_id,
+                "recipient_id": recipient_id,
+                "amount": float(payment["amount"]),
+                "currency": payment.get("currency", "NGN"),
+                "bank_code": bank["bank_code"],
+                "bank_name": bank["bank_name"],
+                "account_number": bank["account_number"],
+                "released_at": datetime.now(timezone.utc).isoformat()
+            }
+        )
+        if audit_res.status_code not in (200, 201):
+            logging.error(f"CRITICAL: released_funds insert failed for reference {reference}: {audit_res.text}")
+
+        logging.info(f"Funds released successfully. Reference: {reference}, Payer: {payer_id}, Recipient: {recipient_id}")
+
+        # ── STEP 9: Notify recipient via socket if online ──────────────────
+        if recipient_id in active_users:
+            socketio.emit("funds_released", {
+                "reference": reference,
+                "amount": float(payment["amount"]),
+                "currency": payment.get("currency", "NGN")
+            }, room=active_users[recipient_id])
+
+        return jsonify({
+            "status": "success",
+            "message": "Funds released successfully"
+        }), 200
+
+    except requests.exceptions.Timeout:
+        logging.error(f"Kora timeout on release. Reference: {reference}")
+        return jsonify({"status": "error", "message": "Payment gateway timed out"}), 504
+    except Exception as e:
+        logging.error(f"release_funds error: {e}")
+        return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
+
 @app.route('/api/user_profile/<string:user_id>', methods=['GET'])
 @jwt_required()
 def get_user_profile(user_id):
