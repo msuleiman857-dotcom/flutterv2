@@ -219,7 +219,7 @@ def release_funds():
                 "recipient_id": f"eq.{recipient_id}",
                 "status": "eq.success",
                 "concluded": "eq.false",
-                "select": "id,reference,payer_id,recipient_id,amount,currency,status,concluded",
+                "select": "id,reference,payer_id,recipient_id,amount,status,concluded",
                 "order": "created_at.asc"
             }
         )
@@ -268,7 +268,7 @@ def release_funds():
                     "destination": {
                         "type": "bank_account",
                         "amount": float(payment["amount"]),
-                        "currency": payment.get("currency", "NGN"),
+                         "currency": "NGN",  
                         "narration": f"Meetup payout to {bank['acct_name']}",
                         "bank_account": {
                             "bank": bank["bank_code"],
