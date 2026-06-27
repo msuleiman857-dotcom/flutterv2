@@ -223,6 +223,13 @@ def release_funds():
                 "order": "created_at.asc"
             }
         )
+        
+        # ── TEMP DEBUG ──────────────────────────────────────────────
+        logging.info(f"DEBUG release_funds: payer_id={payer_id}, recipient_id={recipient_id}")
+        logging.info(f"DEBUG pay_res status: {pay_res.status_code}")
+        logging.info(f"DEBUG pay_res body: {pay_res.text}")
+        # ───────────────────────────────────────────────────────────
+        
         if pay_res.status_code != 200 or not pay_res.json():
             return jsonify({"status": "error", "message": "No pending payments found"}), 404
 
