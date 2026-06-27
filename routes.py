@@ -740,47 +740,6 @@ def accept_payment_bubble():
         logging.error(f"accept_payment_bubble error: {e}")
         return jsonify({"status": "error", "message": "Internal error"}), 500
 
-@app.route('/api/payments/exists', methods=['GET'])
-@jwt_required()
-def payment_exists():
-    """Returns whether a success payment exists between two users."""
-    try:
-        user_id = get_jwt_identity()
-        other_id = request.args.get('other_id')
-
-        if not other_id:
-            return jsonify({"exists": False}), 400
-
-        supabase_url = os.getenv('SUPABASE_URL')
-        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
-        headers = {
-            "apikey": supabase_key,
-            "Authorization": f"Bearer {supabase_key}"
-        }
-
-        res = requests.get(
-            f"{supabase_url}/rest/v1/payments",
-            headers=headers,
-            params={
-                "or": f"(and(payer_id.eq.{user_id},recipient_id.eq.{other_id}),and(payer_id.eq.{other_id},recipient_id.eq.{user_id}))",
-                "status": "eq.success",
-                "select": "id,payer_id",
-                "limit": "1"
-            }
-        )
-
-        if res.status_code == 200 and res.json():
-            row = res.json()[0]
-            # is_payer tells Flutter whether to show Release Funds
-            is_payer = str(row['payer_id']) == str(user_id)
-            return jsonify({"exists": True, "is_payer": is_payer}), 200
-
-        return jsonify({"exists": False, "is_payer": False}), 200
-
-    except Exception as e:
-        logging.error(f"payment_exists error: {e}")
-        return jsonify({"exists": False, "is_payer": False}), 500
-
 @socketio.on('profile_pic_updated')
 def handle_profile_pic_updated(data):
     user_id = str(data.get('user_id'))
