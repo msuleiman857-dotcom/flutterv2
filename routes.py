@@ -314,7 +314,7 @@ def release_funds():
                         "payer_id": payer_id,
                         "recipient_id": recipient_id,
                         "amount": float(payment["amount"]),
-                        "currency": payment.get("currency", "NGN"),
+                        "currency": "NGN",
                         "bank_code": bank["bank_code"],
                         "bank_name": bank["bank_name"],
                         "account_number": bank["account_number"],
