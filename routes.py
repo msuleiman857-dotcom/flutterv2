@@ -146,6 +146,50 @@ def upload_profile_pic():
         logging.error(f"upload_profile_pic error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
 
+@app.route('/api/payments/exists', methods=['GET'])
+@jwt_required()
+def payment_exists():
+    try:
+        user_id = get_jwt_identity()
+        other_id = request.args.get('other_id')
+
+        if not other_id:
+            return jsonify({"exists": False}), 400
+
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+
+        res = requests.get(
+            f"{supabase_url}/rest/v1/payments",
+            headers=headers,
+            params={
+                "or": f"(and(payer_id.eq.{user_id},recipient_id.eq.{other_id}),and(payer_id.eq.{other_id},recipient_id.eq.{user_id}))",
+                "status": "eq.success",
+                "concluded": "eq.false",        # ← only unreleased payments
+                "select": "id,payer_id,reference",  # ← add reference here
+                "limit": "1"
+            }
+        )
+
+        if res.status_code == 200 and res.json():
+            row = res.json()[0]
+            is_payer = str(row['payer_id']) == str(user_id)
+            return jsonify({
+                "exists": True,
+                "is_payer": is_payer,
+                "reference": row['reference']   # ← return it
+            }), 200
+
+        return jsonify({"exists": False, "is_payer": False, "reference": None}), 200
+
+    except Exception as e:
+        logging.error(f"payment_exists error: {e}")
+        return jsonify({"exists": False, "is_payer": False, "reference": None}), 500
+
 @app.route("/api/payments/release", methods=["POST"])
 @jwt_required()
 def release_funds():
