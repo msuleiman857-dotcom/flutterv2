@@ -1407,8 +1407,6 @@ def api_login():
             bank_institution = None
             try:
                 bank_res = requests.get(
-                    f"{url}".replace("/rest/v1/users", "") +  # reuse base URL cleanly
-                    # easier: just build it directly:
                     f"{os.getenv('SUPABASE_URL')}/rest/v1/linked_bank",
                     headers=headers,
                     params={"owner_id": f"eq.{user['id']}", "select": "account_number,bank_name"}
