@@ -1899,7 +1899,6 @@ def get_conversations(user_id):
         return jsonify({"status": "error", "message": "Unauthorized action"}), 403
 
     try:
-        # ✨ THE HTTPS FIREWALL BYPASS ✨
         url = f"{os.getenv('SUPABASE_URL')}/rest/v1/rpc/get_user_conversations"
         headers = {
             "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
@@ -1907,38 +1906,80 @@ def get_conversations(user_id):
             "Content-Type": "application/json"
         }
 
-        # Tell the Supabase database function which user we are looking up
-        payload = {"p_user_id": user_id}
-
-        # Send the request over standard Port 443 Web Traffic!
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json={"p_user_id": user_id})
 
         if response.status_code != 200:
             logging.error(f"Supabase RPC error: {response.text}")
             return jsonify({"status": "error", "message": "Database error"}), 500
 
         conversations = response.json()
-        print(conversations)
-
-        # You might need to update this to the HTTPS version too if it still uses cursors!
         current_user_premium = bool(is_premium_user(None, user_id))
 
-        # Format the data for Flutter exactly like before
+        # ── Decrypt + format each conversation first ───────────────────────
         for conv in conversations:
-            if conv.get('last_msg_time'):
-                dt = parse_supabase_ts(conv['last_msg_time'])
-                conv['last_msg_time'] = dt.strftime('%H:%M')
-
             conv['is_other_typing'] = bool(conv.get('is_other_typing', False))
             conv['is_read'] = bool(conv.get('is_read', False))
             conv['is_premium'] = bool(conv.get('is_premium', False))
-
             if not current_user_premium:
                 conv['other_typing_text'] = None
-
             if conv.get('message_content') and fernet:
                 try:
-                    conv['message_content'] = fernet.decrypt(conv['message_content'].encode()).decode()
+                    conv['message_content'] = fernet.decrypt(
+                        conv['message_content'].encode()
+                    ).decode()
+                except:
+                    pass
+
+        # ── Pull latest payment per conversation and patch if more recent ──
+        try:
+            pay_headers = {
+                "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+                "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+            }
+            for conv in conversations:
+                other_id = conv.get('id')
+                if not other_id:
+                    continue
+                try:
+                    pay_res = requests.get(
+                        f"{os.getenv('SUPABASE_URL')}/rest/v1/payments",
+                        headers=pay_headers,
+                        params={
+                            "or": f"(and(payer_id.eq.{user_id},recipient_id.eq.{other_id}),and(payer_id.eq.{other_id},recipient_id.eq.{user_id}))",
+                            "status": "eq.success",
+                            "select": "amount,payer_id,created_at",
+                            "order": "created_at.desc",
+                            "limit": "1",
+                        }
+                    )
+                    if pay_res.status_code == 200 and pay_res.json():
+                        payment = pay_res.json()[0]
+                        pay_time = parse_supabase_ts(payment['created_at'])
+                        last_msg_time = conv.get('last_msg_time')
+                        msg_time = parse_supabase_ts(last_msg_time) if last_msg_time else None
+
+                        if msg_time is None or pay_time >= msg_time:
+                            is_me = str(payment['payer_id']) == str(user_id)
+                            amount = payment['amount']
+                            conv['message_content'] = (
+                                f"You sent ₦{amount}" if is_me
+                                else f"Payment received • ₦{amount}"
+                            )
+                            # Format time for Flutter display
+                            conv['last_msg_time'] = pay_time.strftime('%H:%M')
+                except Exception as conv_pay_err:
+                    logging.warning(f"Payment patch failed for conv {other_id}: {conv_pay_err}")
+        except Exception as pay_err:
+            logging.warning(f"Payment preview block failed: {pay_err}")
+
+        # ── Format last_msg_time for any convs not patched by payment ─────
+        for conv in conversations:
+            raw_time = conv.get('last_msg_time')
+            if raw_time and ':' not in str(raw_time)[-5:]:
+                # Only reformat if it's still a raw ISO timestamp, not already HH:MM
+                try:
+                    dt = parse_supabase_ts(raw_time)
+                    conv['last_msg_time'] = dt.strftime('%H:%M')
                 except:
                     pass
 
