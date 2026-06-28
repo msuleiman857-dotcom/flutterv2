@@ -1962,8 +1962,8 @@ def get_conversations(user_id):
                             is_me = str(payment['payer_id']) == str(user_id)
                             amount = payment['amount']
                             conv['message_content'] = (
-                                f"You sent ₦{amount}" if is_me
-                                else f"Payment received • ₦{amount}"
+                                f"You Sent ₦{amount}" if is_me
+                                else f"You Received • ₦{amount}"
                             )
                             # Format time for Flutter display
                             conv['last_msg_time'] = pay_time.strftime('%H:%M')
@@ -1973,15 +1973,15 @@ def get_conversations(user_id):
             logging.warning(f"Payment preview block failed: {pay_err}")
 
         # ── Format last_msg_time for any convs not patched by payment ─────
+        # REPLACE the second formatting loop with this:
         for conv in conversations:
             raw_time = conv.get('last_msg_time')
-            if raw_time and ':' not in str(raw_time)[-5:]:
-                # Only reformat if it's still a raw ISO timestamp, not already HH:MM
+            if raw_time:
                 try:
                     dt = parse_supabase_ts(raw_time)
                     conv['last_msg_time'] = dt.strftime('%H:%M')
                 except:
-                    pass
+                    pass  # already formatted as HH:MM, leave it
 
         return jsonify({
             "status": "success",
