@@ -263,12 +263,13 @@ def release_funds():
         for payment in payments:
             reference = payment["reference"]
             try:
+                payout_amount = round(float(payment["amount"]) * 0.8, 2)
                 kora_payload = {
                     "reference": f"RELEASE-{reference}",
                     "destination": {
                         "type": "bank_account",
-                        "amount": float(payment["amount"]),
-                         "currency": "NGN",  
+                        "amount": payout_amount,
+                        "currency": "NGN",  
                         "narration": f"Meetup payout to {bank['acct_name']}",
                         "bank_account": {
                             "bank": bank["bank_code"],
