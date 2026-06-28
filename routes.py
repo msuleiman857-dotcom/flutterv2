@@ -2034,18 +2034,23 @@ def create_post():
 @app.route('/api/conversations/<string:user_id>', methods=['GET'])
 @jwt_required()
 def get_conversations(user_id):
+    # Security Check
     if str(user_id) != get_jwt_identity():
         return jsonify({"status": "error", "message": "Unauthorized action"}), 403
 
     try:
-        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/rpc/get_user_conversations"
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        
         headers = {
-            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
             "Content-Type": "application/json"
         }
 
-        response = requests.post(url, headers=headers, json={"p_user_id": user_id})
+        # ── 1. Fetch conversations from Supabase RPC ────────────────────────
+        rpc_url = f"{supabase_url}/rest/v1/rpc/get_user_conversations"
+        response = requests.post(rpc_url, headers=headers, json={"p_user_id": user_id})
 
         if response.status_code != 200:
             logging.error(f"Supabase RPC error: {response.text}")
@@ -2054,34 +2059,39 @@ def get_conversations(user_id):
         conversations = response.json()
         current_user_premium = bool(is_premium_user(None, user_id))
 
-        # ── Decrypt + format each conversation first ───────────────────────
+        # ── 2. Decrypt + format basic conversation data ─────────────────────
         for conv in conversations:
             conv['is_other_typing'] = bool(conv.get('is_other_typing', False))
             conv['is_read'] = bool(conv.get('is_read', False))
             conv['is_premium'] = bool(conv.get('is_premium', False))
+            
             if not current_user_premium:
                 conv['other_typing_text'] = None
+                
             if conv.get('message_content') and fernet:
                 try:
                     conv['message_content'] = fernet.decrypt(
                         conv['message_content'].encode()
                     ).decode()
-                except:
-                    pass
+                except Exception:
+                    pass  # Ignore decryption errors (fallback to raw text if needed)
 
-        # ── Pull latest payment per conversation and patch if more recent ──
+        # ── 3. Pull latest payment per conversation and patch if more recent 
         try:
+            # We don't need Content-Type for GET requests
             pay_headers = {
-                "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-                "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
             }
+            
             for conv in conversations:
                 other_id = conv.get('id')
                 if not other_id:
                     continue
+                    
                 try:
                     pay_res = requests.get(
-                        f"{os.getenv('SUPABASE_URL')}/rest/v1/payments",
+                        f"{supabase_url}/rest/v1/payments",
                         headers=pay_headers,
                         params={
                             "or": f"(and(payer_id.eq.{user_id},recipient_id.eq.{other_id}),and(payer_id.eq.{other_id},recipient_id.eq.{user_id}))",
@@ -2091,37 +2101,48 @@ def get_conversations(user_id):
                             "limit": "1",
                         }
                     )
+                    
                     if pay_res.status_code == 200 and pay_res.json():
                         payment = pay_res.json()[0]
                         pay_time = parse_supabase_ts(payment['created_at'])
+                        
                         last_msg_time = conv.get('last_msg_time')
                         msg_time = parse_supabase_ts(last_msg_time) if last_msg_time else None
 
+                        # If payment is newer than the last text message, overwrite preview
                         if msg_time is None or pay_time >= msg_time:
                             is_me = str(payment['payer_id']) == str(user_id)
                             amount = payment['amount']
+                            
                             conv['message_content'] = (
                                 f"You Sent ₦{amount}" if is_me
                                 else f"You Received • ₦{amount}"
                             )
-                            # Format time for Flutter display
+                            # Pre-format time for Flutter display
                             conv['last_msg_time'] = pay_time.strftime('%H:%M')
+                            
                 except Exception as conv_pay_err:
                     logging.warning(f"Payment patch failed for conv {other_id}: {conv_pay_err}")
+                    
         except Exception as pay_err:
             logging.warning(f"Payment preview block failed: {pay_err}")
 
-        # ── Format last_msg_time for any convs not patched by payment ─────
-        # REPLACE the second formatting loop with this:
+        # ── 4. Format last_msg_time for convs NOT patched by payment ────────
         for conv in conversations:
             raw_time = conv.get('last_msg_time')
             if raw_time:
+                # If it's already HH:MM (patched by block 3), skip parsing!
+                if isinstance(raw_time, str) and len(raw_time) <= 5 and ':' in raw_time:
+                    continue 
+
                 try:
                     dt = parse_supabase_ts(raw_time)
                     conv['last_msg_time'] = dt.strftime('%H:%M')
-                except:
-                    pass  # already formatted as HH:MM, leave it
+                except Exception as parse_err:
+                    logging.warning(f"Failed to parse time {raw_time}: {parse_err}")
+                    pass  # Leave as is if parsing fails
 
+        # ── 5. Return Final Payload ─────────────────────────────────────────
         return jsonify({
             "status": "success",
             "conversations": conversations,
