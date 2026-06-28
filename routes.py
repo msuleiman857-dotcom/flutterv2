@@ -402,6 +402,45 @@ def upload_media():
         logging.error(f"upload_media error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
 
+@app.route('/api/update_price', methods=['POST'])
+@jwt_required()
+def update_price():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json(silent=True) or {}
+        new_price = data.get('price_naira')
+
+        if new_price is None:
+            return jsonify({"status": "error", "message": "Price is required"}), 400
+
+        supabase_url = os.getenv('SUPABASE_URL')
+        headers = {
+            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+            "Content-Type": "application/json"
+        }
+
+        # Update the database
+        res = requests.patch(
+            f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
+            headers=headers,
+            json={"price_naira": float(new_price)}
+        )
+
+        if res.status_code in (200, 204):
+            # ✨ REAL-TIME MAGIC: Tell all active feeds that this user changed their price
+            socketio.emit('price_updated', {
+                'user_id': str(user_id),
+                'price_naira': float(new_price)
+            })
+            return jsonify({"status": "success", "message": "Price updated!"}), 200
+        else:
+            return jsonify({"status": "error", "message": "Database error"}), 500
+
+    except Exception as e:
+        logging.error(f"update_price error: {e}")
+        return jsonify({"status": "error", "message": "Internal error"}), 500
+
 @app.route('/api/user_profile/<string:user_id>', methods=['GET'])
 @jwt_required()
 def get_user_profile(user_id):
@@ -420,7 +459,7 @@ def get_user_profile(user_id):
         user_res = requests.get(
             f"{supabase_url}/rest/v1/users",
             headers=headers,
-            params={"id": f"eq.{user_id}", "select": "username,kyc,profile_pic_url"}
+            params={"id": f"eq.{user_id}", "select": "username,kyc,profile_pic_url,price_naira"}
         )
         if user_res.status_code != 200 or not user_res.json():
             return jsonify({"status": "error", "message": "User not found"}), 404
