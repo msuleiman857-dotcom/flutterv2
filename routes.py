@@ -1265,12 +1265,10 @@ def korapay_webhook():
         received_sig = request.headers.get('X-Korapay-Signature', '')
         secret_key = os.getenv('KORAPAY_SECRET_KEY')
 
-        # Parse payload first
         data = request.get_json(silent=True)
         if not data:
             return jsonify({"status": "error", "message": "No payload"}), 400
 
-        # Sign ONLY the data object as Korapay docs specify
         data_object = data.get('data', {})
         data_string = json.dumps(data_object, separators=(',', ':'), sort_keys=False)
         expected_sig = hmac.new(
@@ -1334,6 +1332,58 @@ def korapay_webhook():
             'recipient_id': payment['recipient_id'],
             'amount': str(payment['amount'])
         })
+
+        # ── Push notification to recipient ─────────────────────────────────
+        try:
+            recipient_id = payment['recipient_id']
+            payer_id = payment['payer_id']
+
+            recipient_res = requests.get(
+                f"{supabase_url}/rest/v1/users?id=eq.{recipient_id}&select=fcm_token",
+                headers=headers
+            )
+            payer_res = requests.get(
+                f"{supabase_url}/rest/v1/users?id=eq.{payer_id}&select=username,profile_pic_url",
+                headers=headers
+            )
+
+            recipient_data = recipient_res.json()[0] if recipient_res.json() else {}
+            payer_data = payer_res.json()[0] if payer_res.json() else {}
+
+            recipient_token = recipient_data.get('fcm_token')
+            payer_username = payer_data.get('username', 'Someone')
+            payer_pic = payer_data.get('profile_pic_url', '')
+            amount = payment['amount']
+
+            if recipient_token:
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title='💰 Payment Received!',
+                        body=f'{payer_username} paid ₦{amount} — funds are held in escrow until you both meet.',
+                    ),
+                    data={
+                        'type': 'payment_received',
+                        'sender_id': str(payer_id),
+                        'sender_name': payer_username,
+                        'sender_pic_url': payer_pic or '',
+                    },
+                    android=messaging.AndroidConfig(
+                        notification=messaging.AndroidNotification(
+                            image=payer_pic if payer_pic else None,
+                        )
+                    ),
+                    webpush=messaging.WebpushConfig(
+                        notification=messaging.WebpushNotification(
+                            image=payer_pic if payer_pic else None,
+                        )
+                    ),
+                    token=recipient_token,
+                )
+                messaging.send(message)
+                logging.info(f"Payment notification sent to recipient {recipient_id}")
+        except Exception as notif_err:
+            logging.warning(f"Failed to send payment notification: {notif_err}")
+        # ──────────────────────────────────────────────────────────────────
 
         logging.info(f"Payment confirmed and emitted for reference: {reference}")
         return jsonify({"status": "success"}), 200
