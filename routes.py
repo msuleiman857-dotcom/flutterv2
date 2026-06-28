@@ -364,6 +364,120 @@ def release_funds():
         logging.error(f"release_funds error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
 
+@app.route("/api/payments/decline", methods=["POST"])
+@jwt_required()
+def decline_payment():
+    recipient_id = get_jwt_identity()
+    data = request.get_json(silent=True) or {}
+    reference = data.get("reference")
+
+    if not reference:
+        return jsonify({"status": "error", "message": "Reference required"}), 400
+
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
+    sb_headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # Fetch the payment
+        pay_res = requests.get(
+            f"{supabase_url}/rest/v1/payments",
+            headers=sb_headers,
+            params={
+                "reference": f"eq.{reference}",
+                "recipient_id": f"eq.{recipient_id}",
+                "status": "eq.success",
+                "concluded": "eq.false",
+                "select": "id,reference,payer_id,recipient_id,amount"
+            }
+        )
+        if pay_res.status_code != 200 or not pay_res.json():
+            return jsonify({"status": "error", "message": "Payment not found"}), 404
+
+        payment = pay_res.json()[0]
+        payer_id = payment["payer_id"]
+        amount = float(payment["amount"])
+
+        # Fetch payer bank details to refund back to sender
+        bank_res = requests.get(
+            f"{supabase_url}/rest/v1/linked_bank",
+            headers=sb_headers,
+            params={
+                "owner_id": f"eq.{payer_id}",
+                "select": "account_number,acct_name,bank_code,bank_name"
+            }
+        )
+        if bank_res.status_code != 200 or not bank_res.json():
+            return jsonify({"status": "error", "message": "Sender has no linked bank account"}), 422
+
+        bank = bank_res.json()[0]
+
+        kora_secret = os.getenv("KORAPAY_SECRET_KEY")
+        kora_base_url = os.getenv("KORA_GCP_BASE_URL")
+        kora_headers = {
+            "Authorization": f"Bearer {kora_secret}",
+            "Content-Type": "application/json"
+        }
+
+        # Refund full amount back to payer — no 80% cut
+        kora_payload = {
+            "reference": f"REFUND-{reference}",
+            "destination": {
+                "type": "bank_account",
+                "amount": amount,
+                "currency": "NGN",
+                "narration": f"Meetup refund to {bank['acct_name']}",
+                "bank_account": {
+                    "bank": bank["bank_code"],
+                    "account": bank["account_number"]
+                },
+                "customer": {
+                    "name": bank["acct_name"],
+                    "email": f"{payer_id}@internal.app"
+                }
+            }
+        }
+
+        kora_res = requests.post(
+            f"{kora_base_url}/merchant/api/v1/transactions/disburse",
+            json=kora_payload,
+            headers=kora_headers,
+            timeout=30
+        )
+
+        if kora_res.status_code not in (200, 201):
+            logging.error(f"Kora refund failed for {reference}: {kora_res.text}")
+            return jsonify({"status": "error", "message": "Refund failed"}), 502
+
+        # Mark payment concluded + declined
+        requests.patch(
+            f"{supabase_url}/rest/v1/payments",
+            headers=sb_headers,
+            params={"reference": f"eq.{reference}"},
+            json={"concluded": True, "is_accepted": False}
+        )
+
+        # Notify payer via socket
+        if str(payer_id) in active_users:
+            socketio.emit("payment_declined", {
+                "reference": reference,
+                "amount": str(amount),
+                "recipient_id": recipient_id,
+                "payer_id": str(payer_id),
+            }, room=active_users[str(payer_id)])
+
+        return jsonify({"status": "success", "message": "Payment declined and refunded"}), 200
+
+    except requests.exceptions.Timeout:
+        return jsonify({"status": "error", "message": "Payment gateway timed out"}), 504
+    except Exception as e:
+        logging.error(f"decline_payment error: {e}")
+        return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
+
 @app.route('/api/upload-media', methods=['POST'])
 @jwt_required()
 def upload_media():
@@ -741,12 +855,13 @@ def accept_payment_bubble():
         supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
         headers = {
             "apikey": supabase_key,
-            "Authorization": f"Bearer {supabase_key}"
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json"
         }
 
         # Fetch payment row to get payer_id
         pay_res = requests.get(
-            f"{supabase_url}/rest/v1/payments?reference=eq.{reference}&select=payer_id,recipient_id,amount,status",
+            f"{supabase_url}/rest/v1/payments?reference=eq.{reference}&select=payer_id,recipient_id,amount,status,concluded",
             headers=headers
         )
         if pay_res.status_code != 200 or not pay_res.json():
@@ -760,10 +875,22 @@ def accept_payment_bubble():
         if user_id != recipient_id:
             return jsonify({"status": "error", "message": "Unauthorized"}), 403
 
-        distance_km = None
+        # Guard: don't accept an already concluded payment
+        if payment.get('concluded'):
+            return jsonify({"status": "error", "message": "Payment already concluded"}), 409
 
+        # ── Mark is_accepted = true in payments table ──────────────────────
+        patch_res = requests.patch(
+            f"{supabase_url}/rest/v1/payments?reference=eq.{reference}",
+            headers=headers,
+            json={"is_accepted": True}
+        )
+        if patch_res.status_code not in (200, 204):
+            logging.error(f"Failed to set is_accepted for {reference}: {patch_res.text}")
+            return jsonify({"status": "error", "message": "Failed to update payment"}), 500
+
+        distance_km = None
         if receiver_lat is not None and receiver_lng is not None:
-            # Fetch only the sender's stored coords
             sender_res = requests.get(
                 f"{supabase_url}/rest/v1/users?id=eq.{payer_id}&select=latitude,longitude,username",
                 headers=headers
@@ -776,14 +903,26 @@ def accept_payment_bubble():
                         float(sender['latitude']), float(sender['longitude'])
                     ), 1)
 
-        # Emit distance event ONLY to the sender's socket room
+        # ── Emit to payer — includes is_accepted so their bubble updates ──
         if payer_id in active_users:
             socketio.emit('payment_accepted', {
                 'reference': reference,
                 'distance_km': distance_km,
                 'receiver_id': recipient_id,
+                'payer_id': payer_id,
+                'is_accepted': True,        # 👈 bubble state for payer
             }, room=active_users[payer_id])
             logging.info(f"payment_accepted emitted to sender {payer_id}, distance={distance_km}km")
+
+        # ── Also emit to recipient themselves so their own bubble updates ──
+        if recipient_id in active_users:
+            socketio.emit('payment_accepted', {
+                'reference': reference,
+                'distance_km': distance_km,
+                'receiver_id': recipient_id,
+                'payer_id': payer_id,
+                'is_accepted': True,        # 👈 bubble state for recipient
+            }, room=active_users[recipient_id])
 
         return jsonify({
             "status": "success",
@@ -2104,7 +2243,7 @@ def get_private_messages(user_id, other_id):
                 headers=pay_headers,
                 params={
                     "or": f"(and(payer_id.eq.{user_id},recipient_id.eq.{other_id}),and(payer_id.eq.{other_id},recipient_id.eq.{user_id}))",
-                    "select": "id,reference,payer_id,recipient_id,amount,status,concluded,created_at",
+                    "select": "id,reference,payer_id,recipient_id,amount,status,concluded,is_accepted,created_at",
                     "order": "created_at.asc"
                 }
             )
@@ -2123,6 +2262,7 @@ def get_private_messages(user_id, other_id):
                         "reference": p['reference'],
                         "amount": p['amount'],
                         "status": p['status'],
+                        "is_accepted": p.get('is_accepted', False),
                         "concluded": p.get('concluded', False), 
                         "sent_at": sent_at,
                         "is_read": True,
