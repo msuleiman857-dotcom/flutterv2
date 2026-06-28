@@ -1366,6 +1366,7 @@ def korapay_webhook():
                         'sender_id': str(payer_id),
                         'sender_name': payer_username,
                         'sender_pic_url': payer_pic or '',
+                        'amount': str(amount)
                     },
                     android=messaging.AndroidConfig(
                         notification=messaging.AndroidNotification(
