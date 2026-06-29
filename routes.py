@@ -1326,7 +1326,7 @@ def initiate_payout():
         except ValueError:
             return jsonify({"status": "error", "message": "Invalid amount"}), 400
 
-        unique_reference = f"PAYME-{user_id[:8].upper()}-{uuid.uuid4().hex[:6].upper()}"
+        unique_reference = f"PAYME-{user_id[:8].upper()}-{uuid.uuid4().hex[:12].upper()}"
 
         payload = {
             "reference": unique_reference,
