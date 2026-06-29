@@ -267,7 +267,7 @@ def release_funds():
                 kora_api_base = "https://api.korapay.com/merchant/api/v1"
                 # ── NEW: VERIFY TRANSACTION ON KORAPAY FIRST ───────────────
                 verify_res = requests.get(
-                    f"{kora_api_base}/merchant/api/v1/charges/{reference}",
+                    f"{base_url}/charges/{reference}",
                     headers=kora_headers,
                     timeout=15
                 )
