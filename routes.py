@@ -106,6 +106,10 @@ def handle_disconnect():
             print(f"User {uid} disconnected.")
             break
 
+@app.route('/')
+def health():
+    return jsonify({"status": "ok"}), 200
+
 @app.route('/api/upload-profile-pic', methods=['POST'])
 @jwt_required()
 def upload_profile_pic():
