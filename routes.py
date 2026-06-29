@@ -200,7 +200,7 @@ def payment_exists():
 def release_funds():
     payer_id = get_jwt_identity()
     data = request.get_json(silent=True) or {}
-    recipient_id = data.get("recipient_id")  # ← now takes recipient_id instead of reference
+    recipient_id = data.get("recipient_id")
 
     if not recipient_id:
         return jsonify({"status": "error", "message": "Recipient ID is required"}), 400
@@ -228,11 +228,8 @@ def release_funds():
             }
         )
         
-        # ── TEMP DEBUG ──────────────────────────────────────────────
         logging.info(f"DEBUG release_funds: payer_id={payer_id}, recipient_id={recipient_id}")
         logging.info(f"DEBUG pay_res status: {pay_res.status_code}")
-        logging.info(f"DEBUG pay_res body: {pay_res.text}")
-        # ───────────────────────────────────────────────────────────
         
         if pay_res.status_code != 200 or not pay_res.json():
             return jsonify({"status": "error", "message": "No pending payments found"}), 404
@@ -267,7 +264,43 @@ def release_funds():
         for payment in payments:
             reference = payment["reference"]
             try:
-                payout_amount = round(float(payment["amount"]) * 0.8, 2)
+                # ── NEW: VERIFY TRANSACTION ON KORAPAY FIRST ───────────────
+                verify_res = requests.get(
+                    f"{kora_base_url}/merchant/api/v1/charges/{reference}",
+                    headers=kora_headers,
+                    timeout=15
+                )
+
+                if verify_res.status_code != 200:
+                    logging.error(f"Kora validation request failed for {reference}: {verify_res.text}")
+                    failed.append(reference)
+                    continue
+
+                verify_data = verify_res.json()
+                kora_data = verify_data.get("data", {})
+
+                # 1. Check status from KoraPay backend
+                if not verify_data.get("status") or kora_data.get("status") != "success":
+                    logging.error(f"Security Alert: Kora backend reports {reference} is not successful. DB mismatch.")
+                    failed.append(reference)
+                    continue
+
+                # 2. Verify amount matches to prevent price tampering
+                try:
+                    kora_amount = float(kora_data.get("amount", 0))
+                    db_amount = float(payment["amount"])
+                    
+                    if abs(kora_amount - db_amount) > 0.01:
+                        logging.error(f"Security Alert: Price mismatch for {reference}. DB: {db_amount}, Kora: {kora_amount}")
+                        failed.append(reference)
+                        continue
+                except (ValueError, TypeError) as price_err:
+                    logging.error(f"Error parsing amount for validation on {reference}: {price_err}")
+                    failed.append(reference)
+                    continue
+                # ───────────────────────────────────────────────────────────
+
+                payout_amount = round(db_amount * 0.8, 2)
                 kora_payload = {
                     "reference": f"RELEASE-{reference}",
                     "destination": {
@@ -346,7 +379,7 @@ def release_funds():
             float(p["amount"]) for p in payments
             if p["reference"] in released
         )
-        if recipient_id in active_users:
+        if recipient_id in active_users: # Make sure active_users is available in scope
             socketio.emit("funds_released", {
                 "references": released,
                 "total_amount": total_released,
