@@ -2059,6 +2059,79 @@ def get_conversations(user_id):
         conversations = response.json()
         current_user_premium = bool(is_premium_user(None, user_id))
 
+        # ── 1.5. Find conversations that exist ONLY via payments ────────────
+        # The RPC above only returns users with at least one row in
+        # `messages`. If two users only ever exchanged a payment (or all
+        # their messages were wiped/expired) they won't be in `conversations`
+        # yet. We find those payment-only partners here and append synthetic
+        # rows so they show up in the list too. Step 3 below already knows
+        # how to turn a payment into a preview line, so we let it handle
+        # these new rows the same way it handles existing ones.
+        try:
+            existing_ids = {str(c.get('id')) for c in conversations if c.get('id')}
+
+            all_pay_res = requests.get(
+                f"{supabase_url}/rest/v1/payments",
+                headers={
+                    "apikey": supabase_key,
+                    "Authorization": f"Bearer {supabase_key}",
+                },
+                params={
+                    "or": f"(payer_id.eq.{user_id},recipient_id.eq.{user_id})",
+                    "status": "eq.success",
+                    "select": "payer_id,recipient_id",
+                }
+            )
+
+            if all_pay_res.status_code == 200:
+                payment_partner_ids = set()
+                for p in all_pay_res.json():
+                    payer = str(p.get('payer_id'))
+                    recipient = str(p.get('recipient_id'))
+                    other = recipient if payer == str(user_id) else payer
+                    if other and other != str(user_id):
+                        payment_partner_ids.add(other)
+
+                missing_ids = payment_partner_ids - existing_ids
+
+                if missing_ids:
+                    users_res = requests.get(
+                        f"{supabase_url}/rest/v1/users",
+                        headers={
+                            "apikey": supabase_key,
+                            "Authorization": f"Bearer {supabase_key}",
+                        },
+                        params={
+                            "id": f"in.({','.join(missing_ids)})",
+                            "select": "id,username,email,profile_pic_url,is_premium",
+                        }
+                    )
+
+                    if users_res.status_code == 200:
+                        for u in users_res.json():
+                            conversations.append({
+                                "id": str(u.get('id')),
+                                "username": u.get('username'),
+                                "email": u.get('email'),
+                                "profile_pic_url": u.get('profile_pic_url'),
+                                "is_premium": bool(u.get('is_premium', False)),
+                                "message_content": None,
+                                "media_content": None,
+                                "last_msg_time": None,
+                                "sender_id": None,
+                                "is_read": True,
+                                "unread_count": 0,
+                                "is_other_typing": False,
+                                "other_typing_text": None,
+                            })
+                    else:
+                        logging.warning(f"Fetching payment-only users failed: {users_res.text}")
+            else:
+                logging.warning(f"Fetching all payments failed: {all_pay_res.text}")
+
+        except Exception as missing_conv_err:
+            logging.warning(f"Payment-only conversation lookup failed: {missing_conv_err}")
+
         # ── 2. Decrypt + format basic conversation data ─────────────────────
         for conv in conversations:
             conv['is_other_typing'] = bool(conv.get('is_other_typing', False))
@@ -2120,6 +2193,9 @@ def get_conversations(user_id):
                             )
                             # Pre-format time for Flutter display
                             conv['last_msg_time'] = pay_time.strftime('%H:%M')
+                            conv['_sort_ts'] = pay_time
+                        else:
+                            conv['_sort_ts'] = msg_time
                             
                 except Exception as conv_pay_err:
                     logging.warning(f"Payment patch failed for conv {other_id}: {conv_pay_err}")
@@ -2137,10 +2213,26 @@ def get_conversations(user_id):
 
                 try:
                     dt = parse_supabase_ts(raw_time)
+                    conv.setdefault('_sort_ts', dt)
                     conv['last_msg_time'] = dt.strftime('%H:%M')
                 except Exception as parse_err:
                     logging.warning(f"Failed to parse time {raw_time}: {parse_err}")
                     pass  # Leave as is if parsing fails
+            else:
+                conv.setdefault('_sort_ts', None)
+
+        # ── 4.5. Re-sort by most recent activity ─────────────────────────────
+        # Original RPC order only reflected message recency. Now that
+        # payments can override the preview (step 3) or be the only reason
+        # a conversation exists at all (step 1.5), we sort on the raw
+        # datetime we tracked along the way instead of relying on row order.
+        # Conversations with no timestamp at all sort to the bottom.
+        conversations.sort(
+            key=lambda c: c.get('_sort_ts') or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        for conv in conversations:
+            conv.pop('_sort_ts', None)
 
         # ── 5. Return Final Payload ─────────────────────────────────────────
         return jsonify({
