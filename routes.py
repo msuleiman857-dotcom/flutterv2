@@ -108,7 +108,7 @@ def handle_disconnect():
 
 @app.route('/')
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "hack me if you can"}), 200
 
 @app.route('/api/upload-profile-pic', methods=['POST'])
 @jwt_required()
