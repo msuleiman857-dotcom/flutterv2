@@ -2069,6 +2069,67 @@ def create_post():
         logging.error(f"Create post error: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
 
+@app.route('/api/posts/by_user/<string:user_id>', methods=['GET'])
+@jwt_required()
+def get_posts_by_user(user_id):
+    """Returns every post belonging to a single user — powers the public profile grid."""
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+
+        url = f"{supabase_url}/rest/v1/posts"
+        params = {
+            "poster_id": f"eq.{user_id}",
+            "select": "*,users(username, profile_pic_url, kyc)",
+            "order": "created_at.desc"
+        }
+
+        response = requests.get(url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            return jsonify({"success": True, "posts": response.json()}), 200
+        else:
+            logging.error(f"Supabase fetch user posts error: {response.text}")
+            return jsonify({"success": False, "message": "Failed to load posts"}), 500
+
+    except Exception as e:
+        logging.error(f"get_posts_by_user error: {e}")
+        return jsonify({"success": False, "message": "Internal server error"}), 500
+
+
+@app.route('/api/public_profile/<string:user_id>', methods=['GET'])
+@jwt_required()
+def get_public_profile(user_id):
+    """Public-safe profile lookup — any logged-in user can view this, unlike
+    /api/user_profile/<id> which is locked to the owner and exposes bank info."""
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+
+        res = requests.get(
+            f"{supabase_url}/rest/v1/users",
+            headers=headers,
+            params={"id": f"eq.{user_id}", "select": "username,profile_pic_url,kyc,price_naira"}
+        )
+
+        if res.status_code != 200 or not res.json():
+            return jsonify({"status": "error", "success": False, "message": "User not found"}), 404
+
+        return jsonify({"status": "success", "success": True, "data": res.json()[0]}), 200
+
+    except Exception as e:
+        logging.error(f"get_public_profile error: {e}")
+        return jsonify({"status": "error", "success": False, "message": "Internal server error"}), 500
+
+
 @app.route('/api/conversations/<string:user_id>', methods=['GET'])
 @jwt_required()
 def get_conversations(user_id):
