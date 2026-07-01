@@ -1359,7 +1359,7 @@ def supabase_posts_webhook():
 
 @app.route('/api/payout/initiate', methods=['POST'])
 @jwt_required()
-@limiter.limit("4 per hour")
+@limiter.limit("10 per hour")
 def initiate_payout():
     try:
         user_id = get_jwt_identity()
