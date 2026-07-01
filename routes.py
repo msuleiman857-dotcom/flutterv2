@@ -54,7 +54,29 @@ load_dotenv(os.path.expanduser("~/flas/.env"))
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "firebase", "firebase-key.json")
+FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "firebase")
+if not firebase_admin._apps:
+    try:
+        # 1. Try to load credentials from an Environment Variable first (For Render)
+        firebase_env_creds = os.getenv("FIREBASE_CREDENTIALS")
+        
+        if firebase_env_creds:
+            cred_dict = json.loads(firebase_env_creds)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+            print("🔥 Firebase initialized successfully via Environment Variable!")
+            
+        # 2. Fallback to the local file if the Environment Variable is missing (For Local Dev)
+        elif FIREBASE_KEY_PATH and os.path.exists(FIREBASE_KEY_PATH):
+            cred = credentials.Certificate(FIREBASE_KEY_PATH)
+            firebase_admin.initialize_app(cred)
+            print("🔥 Firebase initialized successfully via local JSON file!")
+            
+        else:
+            print("⚠️ Firebase init failed: No credentials found in ENV or File.")
+            
+    except Exception as e:
+        print(f"⚠️ Firebase init failed: {e}")
 
 if not firebase_admin._apps:
     try:
