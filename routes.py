@@ -615,6 +615,34 @@ def update_price():
         logging.error(f"update_price error: {e}")
         return jsonify({"status": "error", "message": "Internal error"}), 500
 
+@app.route('/api/public_profile/<string:user_id>', methods=['GET'])
+@jwt_required()
+def get_public_profile(user_id):
+    """Public-safe profile lookup — any logged-in user can view this, unlike
+    /api/user_profile/<id> which is locked to the owner and exposes bank info."""
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+
+        res = requests.get(
+            f"{supabase_url}/rest/v1/users",
+            headers=headers,
+            params={"id": f"eq.{user_id}", "select": "username,profile_pic_url,kyc,price_naira,latitude,longitude"}
+        )
+
+        if res.status_code != 200 or not res.json():
+            return jsonify({"status": "error", "success": False, "message": "User not found"}), 404
+
+        return jsonify({"status": "success", "success": True, "data": res.json()[0]}), 200
+
+    except Exception as e:
+        logging.error(f"get_public_profile error: {e}")
+        return jsonify({"status": "error", "success": False, "message": "Internal server error"}), 500
+
 @app.route('/api/user_profile/<string:user_id>', methods=['GET'])
 @jwt_required()
 def get_user_profile(user_id):
