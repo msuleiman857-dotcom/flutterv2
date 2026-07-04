@@ -223,8 +223,34 @@ def payment_exists():
         logging.error(f"payment_exists error: {e}")
         return jsonify({"exists": False, "is_payer": False, "reference": None}), 500
 
+def get_payout_status(reference, kora_headers, kora_api_base, timeout=15):
+    """
+    Source-of-truth check: does Kora already have a record of this payout reference?
+    Returns:
+      {"found": True,  "status": "success"|"processing"|"pending"|"failed", "raw": {...}}
+      {"found": False, "status": None, "raw": None}                # Kora has never seen this reference
+      {"found": None,  "status": None, "raw": {"error": "..."}}    # unknown — Kora unreachable/errored
+    "found": None must ALWAYS be treated as "do not disburse" by the caller — never assume
+    absence of confirmation means it's safe to pay.
+    """
+    url = f"{kora_api_base}/transactions/{reference}"
+    try:
+        response = requests.get(url, headers=kora_headers, timeout=timeout)
+        if response.status_code == 404:
+            return {"found": False, "status": None, "raw": None}
+        if response.status_code != 200:
+            logging.error(f"get_payout_status non-200 for {reference}: {response.status_code} {response.text}")
+            return {"found": None, "status": None, "raw": {"error": response.text}}
+        payload = response.json()
+        record = payload.get("data", {}) or {}
+        return {"found": True, "status": record.get("status"), "raw": payload}
+    except requests.exceptions.RequestException as e:
+        logging.error(f"get_payout_status request error for {reference}: {e}")
+        return {"found": None, "status": None, "raw": {"error": str(e)}}
+
 @app.route("/api/payments/release", methods=["POST"])
 @jwt_required()
+@limiter.limit("10 per minute")
 def release_funds():
     payer_id = get_jwt_identity()
     data = request.get_json(silent=True) or {}
@@ -233,11 +259,23 @@ def release_funds():
     if not recipient_id:
         return jsonify({"status": "error", "message": "Recipient ID is required"}), 400
 
+    if str(payer_id) == str(recipient_id):
+        logging.error(f"Security Alert: self-payout attempt by {payer_id}")
+        return jsonify({"status": "error", "message": "Invalid recipient"}), 400
+
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
     sb_headers = {
         "apikey": supabase_key,
         "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json"
+    }
+
+    kora_api_base = "https://api.korapay.com/merchant/api/v1"
+    kora_base_url = os.getenv("KORA_GCP_BASE_URL")
+    kora_secret = os.getenv("KORAPAY_SECRET_KEY")
+    kora_headers = {
+        "Authorization": f"Bearer {kora_secret}",
         "Content-Type": "application/json"
     }
 
@@ -253,12 +291,9 @@ def release_funds():
                 "concluded": "eq.false",
                 "select": "id,reference,payer_id,recipient_id,amount,status,concluded",
                 "order": "created_at.asc"
-            }
+            },
+            timeout=15
         )
-        
-        logging.info(f"DEBUG release_funds: payer_id={payer_id}, recipient_id={recipient_id}")
-        logging.info(f"DEBUG pay_res status: {pay_res.status_code}")
-        
         if pay_res.status_code != 200 or not pay_res.json():
             return jsonify({"status": "error", "message": "No pending payments found"}), 404
 
@@ -271,35 +306,28 @@ def release_funds():
             params={
                 "owner_id": f"eq.{recipient_id}",
                 "select": "account_number,acct_name,bank_code,bank_name"
-            }
+            },
+            timeout=15
         )
         if bank_res.status_code != 200 or not bank_res.json():
             return jsonify({"status": "error", "message": "Recipient has no linked bank account"}), 422
 
         bank = bank_res.json()[0]
 
-        kora_base_url = os.getenv("KORA_GCP_BASE_URL")
-        kora_secret = os.getenv("KORAPAY_SECRET_KEY")
-        kora_headers = {
-            "Authorization": f"Bearer {kora_secret}",
-            "Content-Type": "application/json"
-        }
-
         released = []
         failed = []
 
-        # ── STEP 3: Loop every unreleased payment and disburse each one ────
         for payment in payments:
             reference = payment["reference"]
+            release_reference = f"RELEASE-{reference}"
+
             try:
-                kora_api_base = "https://api.korapay.com/merchant/api/v1"
-                # ── NEW: VERIFY TRANSACTION ON KORAPAY FIRST ───────────────
+                # ── STEP 3a: Verify the original pay-in still checks out on Kora ──
                 verify_res = requests.get(
                     f"{kora_api_base}/charges/{reference}",
                     headers=kora_headers,
                     timeout=15
                 )
-
                 if verify_res.status_code != 200:
                     logging.error(f"Kora validation request failed for {reference}: {verify_res.text}")
                     failed.append(reference)
@@ -308,34 +336,104 @@ def release_funds():
                 verify_data = verify_res.json()
                 kora_data = verify_data.get("data", {})
 
-                # 1. Check status from KoraPay backend
                 if not verify_data.get("status") or kora_data.get("status") != "success":
-                    logging.error(f"Security Alert: Kora backend reports {reference} is not successful. DB mismatch.")
+                    logging.error(f"Security Alert: Kora reports {reference} not successful. DB mismatch.")
                     failed.append(reference)
                     continue
 
-                # 2. Verify amount matches to prevent price tampering
                 try:
                     kora_amount = float(kora_data.get("amount", 0))
                     db_amount = float(payment["amount"])
-                    
                     if abs(kora_amount - db_amount) > 0.01:
                         logging.error(f"Security Alert: Price mismatch for {reference}. DB: {db_amount}, Kora: {kora_amount}")
                         failed.append(reference)
                         continue
                 except (ValueError, TypeError) as price_err:
-                    logging.error(f"Error parsing amount for validation on {reference}: {price_err}")
+                    logging.error(f"Error parsing amount for {reference}: {price_err}")
                     failed.append(reference)
                     continue
-                # ───────────────────────────────────────────────────────────
 
+                if kora_data.get("currency") != "NGN":
+                    logging.error(f"Security Alert: Currency mismatch for {reference}: {kora_data.get('currency')}")
+                    failed.append(reference)
+                    continue
+
+                # ── STEP 3b: Idempotency guard — ask Kora if this payout already exists ──
+                payout_check = get_payout_status(release_reference, kora_headers, kora_api_base)
+
+                if payout_check["found"] is None:
+                    # Unknown state — fail closed, never disburse on uncertainty
+                    logging.error(f"Could not verify payout status for {release_reference} — skipping for safety")
+                    failed.append(reference)
+                    continue
+
+                if payout_check["found"] and payout_check["status"] == "success":
+                    # Already paid for real (likely a stuck/desynced DB row). Reconcile, don't re-pay.
+                    logging.warning(f"{release_reference} already succeeded on Kora — reconciling only")
+                    requests.patch(
+                        f"{supabase_url}/rest/v1/payments",
+                        headers=sb_headers,
+                        params={"reference": f"eq.{reference}", "payer_id": f"eq.{payer_id}"},
+                        json={"concluded": True}
+                    )
+                    existing_audit = requests.get(
+                        f"{supabase_url}/rest/v1/released_funds",
+                        headers=sb_headers,
+                        params={"reference": f"eq.{reference}", "select": "id"}
+                    )
+                    if existing_audit.status_code == 200 and not existing_audit.json():
+                        requests.post(
+                            f"{supabase_url}/rest/v1/released_funds",
+                            headers={**sb_headers, "Prefer": "return=representation"},
+                            json={
+                                "reference": reference,
+                                "payer_id": payer_id,
+                                "recipient_id": recipient_id,
+                                "amount": float(payout_check["raw"]["data"].get("amount", 0)),
+                                "currency": "NGN",
+                                "bank_code": bank["bank_code"],
+                                "bank_name": bank["bank_name"],
+                                "account_number": bank["account_number"],
+                                "released_at": datetime.now(timezone.utc).isoformat()
+                            }
+                        )
+                    released.append(reference)
+                    continue
+
+                if payout_check["found"] and payout_check["status"] in ("processing", "pending"):
+                    logging.warning(f"{release_reference} already {payout_check['status']} on Kora — not re-triggering")
+                    failed.append(reference)
+                    continue
+
+                # payout_check["found"] is False, or status == "failed" → safe to attempt disbursement
+
+                # ── STEP 3c: Atomically claim this payment right before paying ──
+                # Conditional PATCH on concluded=eq.false is the actual race-condition fix:
+                # Postgres serializes concurrent UPDATEs on the same row, so only one concurrent
+                # request can ever flip this to True. The other gets zero rows back.
+                claim_res = requests.patch(
+                    f"{supabase_url}/rest/v1/payments",
+                    headers={**sb_headers, "Prefer": "return=representation"},
+                    params={
+                        "reference": f"eq.{reference}",
+                        "payer_id": f"eq.{payer_id}",
+                        "concluded": "eq.false"
+                    },
+                    json={"concluded": True}
+                )
+                claimed_rows = claim_res.json() if claim_res.status_code == 200 else []
+                if not claimed_rows:
+                    logging.warning(f"{reference} already claimed by a concurrent request — skipping")
+                    continue
+
+                # ── STEP 3d: Disburse ────────────────────────────────────────
                 payout_amount = round(db_amount * 0.8, 2)
                 kora_payload = {
-                    "reference": f"RELEASE-{reference}",
+                    "reference": release_reference,
                     "destination": {
                         "type": "bank_account",
                         "amount": payout_amount,
-                        "currency": "NGN",  
+                        "currency": "NGN",
                         "narration": f"Meetup payout to {bank['acct_name']}",
                         "bank_account": {
                             "bank": bank["bank_code"],
@@ -348,67 +446,80 @@ def release_funds():
                     }
                 }
 
-                kora_res = requests.post(
-                    f"{kora_base_url}/merchant/api/v1/transactions/disburse",
-                    json=kora_payload,
-                    headers=kora_headers,
-                    timeout=30
-                )
-
-                if kora_res.status_code not in (200, 201):
-                    logging.error(f"Kora disburse failed for {reference}: {kora_res.text}")
+                try:
+                    kora_res = requests.post(
+                        f"{kora_base_url}/merchant/api/v1/transactions/disburse",
+                        json=kora_payload,
+                        headers=kora_headers,
+                        timeout=30
+                    )
+                except requests.exceptions.Timeout:
+                    # We genuinely don't know if this succeeded on Kora's end or not.
+                    # Revert the claim so it's eligible for retry — the payout_check pre-check
+                    # above will catch it next time if it actually did go through.
+                    logging.error(f"Disburse call timed out for {reference} — reverting claim")
+                    requests.patch(
+                        f"{supabase_url}/rest/v1/payments",
+                        headers=sb_headers,
+                        params={"reference": f"eq.{reference}", "payer_id": f"eq.{payer_id}"},
+                        json={"concluded": False}
+                    )
                     failed.append(reference)
                     continue
 
-                # ── STEP 4: Mark this payment concluded ────────────────────
-                requests.patch(
-                    f"{supabase_url}/rest/v1/payments",
-                    headers=sb_headers,
-                    params={
-                        "reference": f"eq.{reference}",
-                        "payer_id": f"eq.{payer_id}",
-                        "concluded": "eq.false"
-                    },
-                    json={"concluded": True}
-                )
+                if kora_res.status_code not in (200, 201):
+                    logging.error(f"Kora disburse failed for {reference}: {kora_res.text}")
+                    requests.patch(
+                        f"{supabase_url}/rest/v1/payments",
+                        headers=sb_headers,
+                        params={"reference": f"eq.{reference}", "payer_id": f"eq.{payer_id}"},
+                        json={"concluded": False}
+                    )
+                    failed.append(reference)
+                    continue
 
-                # ── STEP 5: Audit trail ────────────────────────────────────
-                requests.post(
-                    f"{supabase_url}/rest/v1/released_funds",
-                    headers={**sb_headers, "Prefer": "return=representation"},
-                    json={
-                        "reference": reference,
-                        "payer_id": payer_id,
-                        "recipient_id": recipient_id,
-                        "amount": payout_amount,
-                        "currency": "NGN",
-                        "bank_code": bank["bank_code"],
-                        "bank_name": bank["bank_name"],
-                        "account_number": bank["account_number"],
-                        "released_at": datetime.now(timezone.utc).isoformat()
-                    }
-                )
+                # ── STEP 3e: Audit trail, with one retry ─────────────────────
+                audit_payload = {
+                    "reference": reference,
+                    "payer_id": payer_id,
+                    "recipient_id": recipient_id,
+                    "amount": payout_amount,
+                    "currency": "NGN",
+                    "bank_code": bank["bank_code"],
+                    "bank_name": bank["bank_name"],
+                    "account_number": bank["account_number"],
+                    "released_at": datetime.now(timezone.utc).isoformat()
+                }
+                audit_ok = False
+                for _ in range(2):
+                    audit_res = requests.post(
+                        f"{supabase_url}/rest/v1/released_funds",
+                        headers={**sb_headers, "Prefer": "return=representation"},
+                        json=audit_payload
+                    )
+                    if audit_res.status_code in (200, 201):
+                        audit_ok = True
+                        break
+                if not audit_ok:
+                    logging.critical(f"PAYOUT SUCCEEDED BUT AUDIT WRITE FAILED for {reference} — needs manual reconciliation")
 
                 released.append(reference)
                 logging.info(f"Released: {reference} → {recipient_id}")
 
+            except requests.exceptions.Timeout:
+                logging.error(f"Timeout processing {reference}")
+                failed.append(reference)
+                continue
             except Exception as e:
                 logging.error(f"Error releasing {reference}: {e}")
                 failed.append(reference)
                 continue
 
         if not released:
-            return jsonify({
-                "status": "error",
-                "message": "All payouts failed. Please try again."
-            }), 502
+            return jsonify({"status": "error", "message": "All payouts failed. Please try again."}), 502
 
-        # ── STEP 6: Notify recipient via socket ────────────────────────────
-        total_released = sum(
-            float(p["amount"]) for p in payments
-            if p["reference"] in released
-        )
-        if recipient_id in active_users: # Make sure active_users is available in scope
+        total_released = sum(float(p["amount"]) for p in payments if p["reference"] in released)
+        if recipient_id in active_users:
             socketio.emit("funds_released", {
                 "references": released,
                 "total_amount": total_released,
@@ -1484,6 +1595,11 @@ def korapay_webhook():
         received_sig = request.headers.get('X-Korapay-Signature', '')
         secret_key = os.getenv('KORAPAY_SECRET_KEY')
 
+        # ── SECURITY FIX: missing signature must be a hard reject, not a skip ──
+        if not received_sig:
+            logging.warning("Korapay webhook rejected: no signature header present")
+            return jsonify({"status": "error", "message": "Missing signature"}), 401
+
         data = request.get_json(silent=True)
         if not data:
             return jsonify({"status": "error", "message": "No payload"}), 400
@@ -1496,121 +1612,219 @@ def korapay_webhook():
             hashlib.sha256
         ).hexdigest()
 
-        if received_sig and not hmac.compare_digest(received_sig, expected_sig):
+        if not hmac.compare_digest(received_sig, expected_sig):
             logging.warning("Korapay webhook signature mismatch")
             return jsonify({"status": "error", "message": "Invalid signature"}), 401
 
         event = data.get('event')
-        payment_data = data.get('data', {})
-        reference = payment_data.get('reference')
-        status = payment_data.get('status')
+        payload_data = data.get('data', {})
+        reference = payload_data.get('reference')
+        status = payload_data.get('status')
 
         if not reference:
             return jsonify({"status": "error", "message": "No reference"}), 400
 
-        if event != 'charge.success' or status != 'success':
-            return jsonify({"status": "ok", "message": "Event ignored"}), 200
-
         supabase_url = os.getenv('SUPABASE_URL')
         supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
-        headers = {
+        sb_headers = {
             "apikey": supabase_key,
             "Authorization": f"Bearer {supabase_key}",
             "Content-Type": "application/json"
         }
 
-        pay_res = requests.get(
-            f"{supabase_url}/rest/v1/payments?reference=eq.{reference}&select=*",
-            headers=headers
-        )
-        if pay_res.status_code != 200 or not pay_res.json():
-            logging.error(f"Korapay webhook: reference not found: {reference}")
-            return jsonify({"status": "error", "message": "Reference not found"}), 404
-
-        payment = pay_res.json()[0]
-
-        if payment['status'] == 'success':
-            logging.info(f"Korapay webhook: already confirmed: {reference}")
-            return jsonify({"status": "ok", "message": "Already processed"}), 200
-
-        update_res = requests.patch(
-            f"{supabase_url}/rest/v1/payments?reference=eq.{reference}",
-            headers=headers,
-            json={
-                "status": "success",
-                "confirmed_at": datetime.now(timezone.utc).isoformat()
-            }
-        )
-        if update_res.status_code not in [200, 204]:
-            logging.error(f"Failed to update payment status: {update_res.text}")
-            return jsonify({"status": "error", "message": "DB update failed"}), 500
-
-        socketio.emit('payment_confirmed', {
-            'reference': reference,
-            'payer_id': payment['payer_id'],
-            'recipient_id': payment['recipient_id'],
-            'amount': str(payment['amount'])
-        })
-
-        # ── Push notification to recipient ─────────────────────────────────
-        try:
-            recipient_id = payment['recipient_id']
-            payer_id = payment['payer_id']
-
-            recipient_res = requests.get(
-                f"{supabase_url}/rest/v1/users?id=eq.{recipient_id}&select=fcm_token",
-                headers=headers
+        # ═══════════════════════════════════════════════════════════════
+        # BRANCH 1: pay-in confirmation (escrow deposit)
+        # ═══════════════════════════════════════════════════════════════
+        if event == 'charge.success' and status == 'success':
+            pay_res = requests.get(
+                f"{supabase_url}/rest/v1/payments?reference=eq.{reference}&select=*",
+                headers=sb_headers
             )
-            payer_res = requests.get(
-                f"{supabase_url}/rest/v1/users?id=eq.{payer_id}&select=username,profile_pic_url",
-                headers=headers
+            if pay_res.status_code != 200 or not pay_res.json():
+                logging.error(f"Korapay webhook: reference not found: {reference}")
+                return jsonify({"status": "error", "message": "Reference not found"}), 404
+
+            payment = pay_res.json()[0]
+
+            if payment['status'] == 'success':
+                logging.info(f"Korapay webhook: already confirmed: {reference}")
+                return jsonify({"status": "ok", "message": "Already processed"}), 200
+
+            update_res = requests.patch(
+                f"{supabase_url}/rest/v1/payments?reference=eq.{reference}",
+                headers=sb_headers,
+                json={"status": "success", "confirmed_at": datetime.now(timezone.utc).isoformat()}
             )
+            if update_res.status_code not in [200, 204]:
+                logging.error(f"Failed to update payment status: {update_res.text}")
+                return jsonify({"status": "error", "message": "DB update failed"}), 500
 
-            recipient_data = recipient_res.json()[0] if recipient_res.json() else {}
-            payer_data = payer_res.json()[0] if payer_res.json() else {}
+            socketio.emit('payment_confirmed', {
+                'reference': reference,
+                'payer_id': payment['payer_id'],
+                'recipient_id': payment['recipient_id'],
+                'amount': str(payment['amount'])
+            })
 
-            recipient_token = recipient_data.get('fcm_token')
-            payer_username = payer_data.get('username', 'Someone')
-            payer_pic = payer_data.get('profile_pic_url', '')
-            amount = payment['amount']
+            try:
+                recipient_id = payment['recipient_id']
+                payer_id = payment['payer_id']
 
-            if recipient_token:
-                message = messaging.Message(
-                    notification=messaging.Notification(
-                        title='💰 Payment Received!',
-                        body=f'{payer_username} paid ₦{amount} — funds are held in escrow until you both meet.',
-                    ),
-                    data={
-                        'type': 'payment_received',
-                        'sender_id': str(payer_id),
-                        'sender_name': payer_username,
-                        'sender_pic_url': payer_pic or '',
-                        'amount': str(amount)
-                    },
-                    android=messaging.AndroidConfig(
-                        notification=messaging.AndroidNotification(
-                            image=payer_pic if payer_pic else None,
-                        )
-                    ),
-                    webpush=messaging.WebpushConfig(
-                        notification=messaging.WebpushNotification(
-                            image=payer_pic if payer_pic else None,
-                        )
-                    ),
-                    token=recipient_token,
+                recipient_res = requests.get(
+                    f"{supabase_url}/rest/v1/users?id=eq.{recipient_id}&select=fcm_token",
+                    headers=sb_headers
                 )
-                messaging.send(message)
-                logging.info(f"Payment notification sent to recipient {recipient_id}")
-        except Exception as notif_err:
-            logging.warning(f"Failed to send payment notification: {notif_err}")
-        # ──────────────────────────────────────────────────────────────────
+                payer_res = requests.get(
+                    f"{supabase_url}/rest/v1/users?id=eq.{payer_id}&select=username,profile_pic_url",
+                    headers=sb_headers
+                )
+                recipient_data = recipient_res.json()[0] if recipient_res.json() else {}
+                payer_data = payer_res.json()[0] if payer_res.json() else {}
+                recipient_token = recipient_data.get('fcm_token')
+                payer_username = payer_data.get('username', 'Someone')
+                payer_pic = payer_data.get('profile_pic_url', '')
+                amount = payment['amount']
 
-        logging.info(f"Payment confirmed and emitted for reference: {reference}")
-        return jsonify({"status": "success"}), 200
+                if recipient_token:
+                    message = messaging.Message(
+                        notification=messaging.Notification(
+                            title='💰 Payment Received!',
+                            body=f'{payer_username} paid ₦{amount} — funds are held in escrow until you both meet.',
+                        ),
+                        data={
+                            'type': 'payment_received',
+                            'sender_id': str(payer_id),
+                            'sender_name': payer_username,
+                            'sender_pic_url': payer_pic or '',
+                            'amount': str(amount)
+                        },
+                        android=messaging.AndroidConfig(
+                            notification=messaging.AndroidNotification(image=payer_pic if payer_pic else None)
+                        ),
+                        webpush=messaging.WebpushConfig(
+                            notification=messaging.WebpushNotification(image=payer_pic if payer_pic else None)
+                        ),
+                        token=recipient_token,
+                    )
+                    messaging.send(message)
+                    logging.info(f"Payment notification sent to recipient {recipient_id}")
+            except Exception as notif_err:
+                logging.warning(f"Failed to send payment notification: {notif_err}")
+
+            logging.info(f"Payment confirmed and emitted for reference: {reference}")
+            return jsonify({"status": "success"}), 200
+
+        # ═══════════════════════════════════════════════════════════════
+        # BRANCH 2: payout confirmation (this is the gap that was missing)
+        # ═══════════════════════════════════════════════════════════════
+        elif event in ('transfer.success', 'transfer.failed'):
+            if not reference.startswith("RELEASE-"):
+                logging.warning(f"Transfer webhook with unexpected reference format: {reference}")
+                return jsonify({"status": "ok", "message": "Ignored"}), 200
+
+            original_reference = reference[len("RELEASE-"):]
+
+            pay_res = requests.get(
+                f"{supabase_url}/rest/v1/payments?reference=eq.{original_reference}&select=*",
+                headers=sb_headers
+            )
+            if pay_res.status_code != 200 or not pay_res.json():
+                logging.error(f"Payout webhook: original payment not found for {reference}")
+                return jsonify({"status": "error", "message": "Reference not found"}), 404
+
+            payment = pay_res.json()[0]
+
+            if event == 'transfer.success':
+                # Idempotency: has this already been recorded? Kora retries webhooks
+                # until it gets a 200, so this WILL be called more than once.
+                existing_audit = requests.get(
+                    f"{supabase_url}/rest/v1/released_funds",
+                    headers=sb_headers,
+                    params={"reference": f"eq.{original_reference}", "select": "id"}
+                )
+                already_recorded = existing_audit.status_code == 200 and existing_audit.json()
+
+                if not already_recorded:
+                    # Cross-check amount before trusting the webhook body
+                    try:
+                        webhook_amount = float(payload_data.get("amount", 0))
+                    except (ValueError, TypeError):
+                        webhook_amount = 0
+
+                    bank_res = requests.get(
+                        f"{supabase_url}/rest/v1/linked_bank",
+                        headers=sb_headers,
+                        params={
+                            "owner_id": f"eq.{payment['recipient_id']}",
+                            "select": "account_number,acct_name,bank_code,bank_name"
+                        }
+                    )
+                    bank = bank_res.json()[0] if bank_res.status_code == 200 and bank_res.json() else {}
+
+                    requests.post(
+                        f"{supabase_url}/rest/v1/released_funds",
+                        headers={**sb_headers, "Prefer": "return=representation"},
+                        json={
+                            "reference": original_reference,
+                            "payer_id": payment['payer_id'],
+                            "recipient_id": payment['recipient_id'],
+                            "amount": webhook_amount,
+                            "currency": payload_data.get("currency", "NGN"),
+                            "bank_code": bank.get("bank_code"),
+                            "bank_name": bank.get("bank_name"),
+                            "account_number": bank.get("account_number"),
+                            "released_at": datetime.now(timezone.utc).isoformat()
+                        }
+                    )
+
+                requests.patch(
+                    f"{supabase_url}/rest/v1/payments?reference=eq.{original_reference}",
+                    headers=sb_headers,
+                    json={"concluded": True}
+                )
+
+                if payment['recipient_id'] in active_users:
+                    socketio.emit("funds_released", {
+                        "references": [original_reference],
+                        "total_amount": payload_data.get("amount"),
+                        "currency": payload_data.get("currency", "NGN")
+                    }, room=active_users[payment['recipient_id']])
+
+                logging.info(f"Payout webhook confirmed release for {original_reference}")
+                return jsonify({"status": "success"}), 200
+
+            else:  # transfer.failed
+                # Don't blindly trust a "failed" event — webhooks can arrive out of
+                # order (a delayed retry of an earlier failure landing after a real
+                # success). Ask Kora directly what the current truth is before reverting.
+                kora_headers = {
+                    "Authorization": f"Bearer {os.getenv('KORAPAY_SECRET_KEY')}",
+                    "Content-Type": "application/json"
+                }
+                current = get_payout_status(reference, kora_headers, "https://api.korapay.com/merchant/api/v1")
+
+                if current["found"] and current["status"] == "success":
+                    logging.warning(f"Stale transfer.failed for {reference} — Kora now shows success, ignoring")
+                    return jsonify({"status": "ok", "message": "Stale event ignored"}), 200
+
+                if payment.get('concluded'):
+                    requests.patch(
+                        f"{supabase_url}/rest/v1/payments?reference=eq.{original_reference}",
+                        headers=sb_headers,
+                        json={"concluded": False}
+                    )
+                    logging.critical(f"Payout failed for {reference} — claim reverted, eligible for retry")
+                else:
+                    logging.error(f"Payout failed for {reference} — payment was not marked concluded")
+
+                return jsonify({"status": "ok", "message": "Failure recorded"}), 200
+
+        else:
+            return jsonify({"status": "ok", "message": "Event ignored"}), 200
 
     except Exception as e:
         logging.error(f"Korapay webhook error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": "Internal error"}), 500
 
 @app.route('/api/payments/check/<reference>', methods=['GET'])
 @jwt_required()
