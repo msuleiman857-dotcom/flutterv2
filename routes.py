@@ -21,7 +21,7 @@ from email_security import send_reset_email, send_verify_email
 from datetime import datetime, timedelta, timezone
 from flask_cors import CORS
 import firebase_admin
-from firebase_admin import credentials, messaging
+from firebase_admin import credentials, messaging, storage
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from cryptography.fernet import Fernet
 import uuid    
@@ -63,14 +63,8 @@ if not firebase_admin._apps:
         if firebase_env_creds:
             cred_dict = json.loads(firebase_env_creds)
             cred = credentials.Certificate(cred_dict)
-            firebase_admin.initialize_app(cred)
+            firebase_admin.initialize_app(cred, {'storageBucket': 'flutterv2-98784.firebasestorage.app'})
             print("🔥 Firebase initialized successfully via Environment Variable!")
-            
-        # 2. Fallback to the local file if the Environment Variable is missing (For Local Dev)
-        elif FIREBASE_KEY_PATH and os.path.exists(FIREBASE_KEY_PATH):
-            cred = credentials.Certificate(FIREBASE_KEY_PATH)
-            firebase_admin.initialize_app(cred)
-            print("🔥 Firebase initialized successfully via local JSON file!")
             
         else:
             print("⚠️ Firebase init failed: No credentials found in ENV or File.")
@@ -542,36 +536,22 @@ def decline_payment():
 @jwt_required()
 def upload_media():
     user_id = get_jwt_identity()
-    
+
     try:
         file = request.files.get('file')
         mime_type = request.form.get('mime_type', 'application/octet-stream')
         ext = request.form.get('ext', 'bin')
-
         if not file:
             return jsonify({'success': False, 'message': 'No file provided'}), 400
-
         unique_id = str(uuid.uuid4())
         storage_path = f"posts/{user_id}/{unique_id}.{ext}"
 
-        url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/meetup/{storage_path}"
-        headers = {
-            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
-            "Content-Type": mime_type,
-            "x-upsert": "true",
-        }
+        bucket = storage.bucket()
+        blob = bucket.blob(storage_path)
+        blob.upload_from_string(file.read(), content_type=mime_type)
+        public_url = f"https://storage.googleapis.com/{bucket.name}/{storage_path}"
 
-        file_bytes = file.read()
-        response = requests.post(url, headers=headers, data=file_bytes)
-
-        if response.status_code in (200, 201):
-            public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/meetup/{storage_path}"
-            return jsonify({'success': True, 'public_url': public_url}), 200
-        else:
-            logging.error(f"Supabase upload error: {response.text}")
-            return jsonify({'success': False, 'message': 'Upload to storage failed'}), 500
-
+        return jsonify({'success': True, 'public_url': public_url}), 200
     except Exception as e:
         logging.error(f"upload_media error: {e}")
         return jsonify({'success': False, 'message': 'Internal server error'}), 500
@@ -2375,26 +2355,15 @@ def get_upload_url():
         return jsonify({'success': False, 'message': 'filename and mime_type required'}), 400
     storage_path = f"posts/{user_id}/{filename}"
     try:
-        url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/upload/sign/meetup/{storage_path}"
-        headers = {
-            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
-        }
-        response = requests.post(url, headers=headers)
-        resp_data = response.json()
-        
-        if response.status_code not in (200, 201):
-            return jsonify({'success': False, 'message': 'Could not generate upload URL'}), 500
-        
-        raw_url = resp_data.get('url', '')
-        
-        # Avoid double /storage/v1 if Supabase already includes it
-        if raw_url.startswith('/storage/v1'):
-            signed_url = f"{os.getenv('SUPABASE_URL')}{raw_url}"
-        else:
-            signed_url = f"{os.getenv('SUPABASE_URL')}/storage/v1{raw_url}"
-        
-        public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/meetup/{storage_path}"
+        bucket = storage.bucket()
+        blob = bucket.blob(storage_path)
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=15),
+            method="PUT",
+            content_type=mime_type,
+        )
+        public_url = f"https://storage.googleapis.com/{bucket.name}/{storage_path}"
         return jsonify({
             'success':    True,
             'signed_url': signed_url,
