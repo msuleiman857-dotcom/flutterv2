@@ -33,17 +33,6 @@ from security import (
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-@app.route('/api/firebase-token', methods=['GET'])
-@jwt_required()
-def get_firebase_token():
-    user_id = get_jwt_identity()
-    try:
-        custom_token = firebase_auth.create_custom_token(user_id)
-        return jsonify({'success': True, 'token': custom_token.decode('utf-8')}), 200
-    except Exception as e:
-        logging.error(f"firebase token error: {e}")
-        return jsonify({'success': False, 'message': 'Internal server error'}), 500
-
 NIGERIAN_BANKS = {
     "044": "Access Bank", "058": "GTBank", "033": "UBA", "057": "Zenith Bank", "011": "First Bank", 
     "214": "FCMB", "070": "Fidelity Bank", "035": "Wema Bank", "050": "Ecobank", "232": "Sterling Bank", 
@@ -137,6 +126,17 @@ def handle_disconnect():
 @app.route('/')
 def health():
     return jsonify({"status": "hack me if you can"}), 200
+
+@app.route('/api/firebase-token', methods=['GET'])
+@jwt_required()
+def get_firebase_token():
+    user_id = get_jwt_identity()
+    try:
+        custom_token = firebase_auth.create_custom_token(user_id)
+        return jsonify({'success': True, 'token': custom_token.decode('utf-8')}), 200
+    except Exception as e:
+        logging.error(f"firebase token error: {e}")
+        return jsonify({'success': False, 'message': 'Internal server error'}), 500
 
 @app.route('/api/upload-profile-pic', methods=['POST'])
 @jwt_required()
