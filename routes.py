@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, messaging, storage
+from firebase_admin import auth as firebase_auth
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from cryptography.fernet import Fernet
 import uuid    
@@ -31,6 +32,17 @@ from security import (
     dummy_verify, verify_password
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+@app.route('/api/firebase-token', methods=['GET'])
+@jwt_required()
+def get_firebase_token():
+    user_id = get_jwt_identity()
+    try:
+        custom_token = firebase_auth.create_custom_token(user_id)
+        return jsonify({'success': True, 'token': custom_token.decode('utf-8')}), 200
+    except Exception as e:
+        logging.error(f"firebase token error: {e}")
+        return jsonify({'success': False, 'message': 'Internal server error'}), 500
 
 NIGERIAN_BANKS = {
     "044": "Access Bank", "058": "GTBank", "033": "UBA", "057": "Zenith Bank", "011": "First Bank", 
