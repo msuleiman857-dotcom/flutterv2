@@ -2797,6 +2797,7 @@ def api_send_message():
         is_stealth = db_data.get('is_stealth', False)
         sender_name = db_data.get('sender_name', 'Someone')
         target_token = db_data.get('fcm_token')
+        message_id = db_data.get('message_id')  # <-- now comes straight from the RPC, no extra query
 
         # ---- Fetch sender profile pic (used in socket + push) ----
         sender_pic_url = None
@@ -2813,28 +2814,6 @@ def api_send_message():
                 sender_pic_url = pic_res.json()[0].get('profile_pic_url')
         except Exception as pic_err:
             logging.warning(f"Could not fetch sender pic: {pic_err}")
-
-        # ---- Fetch real message ID ----
-        message_id = None
-        try:
-            msg_res = requests.get(
-                f"{os.getenv('SUPABASE_URL')}/rest/v1/messages",
-                headers={
-                    "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-                    "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
-                },
-                params={
-                    "sender_id": f"eq.{sender_id}",
-                    "receiver_id": f"eq.{receiver_id}",
-                    "order": "sent_at.desc",
-                    "limit": "1",
-                    "select": "id"
-                }
-            )
-            if msg_res.status_code == 200 and msg_res.json():
-                message_id = msg_res.json()[0].get('id')
-        except Exception as e:
-            logging.error(f"Failed to fetch new message ID: {e}")
 
         # ---- WebSocket delivery ----
         receiver_id_str = str(receiver_id)
@@ -2861,41 +2840,44 @@ def api_send_message():
             except Exception as e:
                 logging.error(f"WebSocket delivery failed: {e}")
 
-        # ---- Push notification (always fires if token exists) ----
+        # ---- Push notification (backgrounded — does NOT block the response) ----
         if target_token:
-            try:
-                if is_stealth:
-                    display_body = "🕶️ Ultra Stealth Message received"
-                else:
-                    display_body = message_content if message_content else "📎 Sent an attachment"
-                    if reply_to_msg_id:
-                        display_body = f"↩️ Replying: {display_body}"
+            def _send_push():
+                try:
+                    if is_stealth:
+                        display_body = "🕶️ Ultra Stealth Message received"
+                    else:
+                        display_body = message_content if message_content else "📎 Sent an attachment"
+                        if reply_to_msg_id:
+                            display_body = f"↩️ Replying: {display_body}"
 
-                messaging.send(messaging.Message(
-                    notification=messaging.Notification(
-                        title=f"New message from {sender_name}",
-                        body=display_body,
-                        image=sender_pic_url or None,
-                    ),
-                    android=messaging.AndroidConfig(
-                        priority='high',
-                        notification=messaging.AndroidNotification(
+                    messaging.send(messaging.Message(
+                        notification=messaging.Notification(
+                            title=f"New message from {sender_name}",
+                            body=display_body,
                             image=sender_pic_url or None,
-                            priority='high',
-                            channel_id='chat_messages',
                         ),
-                    ),
-                    data={
-                        "type": "chat_message",
-                        "sender_id": str(sender_id),
-                        "sender_name": sender_name,
-                        "sender_pic_url": sender_pic_url or "",
-                        "is_stealth": "true" if is_stealth else "false"
-                    },
-                    token=target_token,
-                ))
-            except Exception as e:
-                logging.error(f"Firebase push error: {e}")
+                        android=messaging.AndroidConfig(
+                            priority='high',
+                            notification=messaging.AndroidNotification(
+                                image=sender_pic_url or None,
+                                priority='high',
+                                channel_id='chat_messages',
+                            ),
+                        ),
+                        data={
+                            "type": "chat_message",
+                            "sender_id": str(sender_id),
+                            "sender_name": sender_name,
+                            "sender_pic_url": sender_pic_url or "",
+                            "is_stealth": "true" if is_stealth else "false"
+                        },
+                        token=target_token,
+                    ))
+                except Exception as e:
+                    logging.error(f"Firebase push error: {e}")
+
+            socketio.start_background_task(_send_push)
 
         return jsonify({
             "status": "success",
