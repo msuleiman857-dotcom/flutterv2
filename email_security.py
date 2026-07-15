@@ -10,28 +10,25 @@ BREVO_SEND_URL = "https://api.brevo.com/v3/smtp/email"
 # same file works for any app, not just this one.
 DEFAULT_APP_NAME = "sapahost"
 DEFAULT_SENDER_EMAIL = "msuleiman857@gmail.com"
-DEFAULT_PRIMARY_COLOR = "#9CB898"     # headline accent / footer text
-DEFAULT_ACCENT_COLOR = "#F14666"      # bold headline word / code box border
-DEFAULT_TAG_COLOR = "#EE8980"         # eyebrow label + code label
-DEFAULT_BACKGROUND_COLOR = "#F9F9F9"
+
+# Monochrome palette — black/white/gray only.
+DEFAULT_TEXT_COLOR = "#1A1C20"
+DEFAULT_MUTED_COLOR = "#6B6F76"
+DEFAULT_BORDER_COLOR = "#1A1C20"
+DEFAULT_BACKGROUND_COLOR = "#F5F5F5"
 
 
 def _build_otp_email_html(
     app_name,
-    eyebrow,
-    heading_light,
-    heading_bold,
-    body_text,
     code,
-    code_label,
-    footer_text,
-    primary_color,
-    accent_color,
-    tag_color,
+    text_color,
+    muted_color,
+    border_color,
     background_color,
 ):
-    """Shared OTP email template. Any two-word heading + code layout can
-    reuse this — reset code, verify code, login code, whatever."""
+    """Shared OTP email template. Deliberately generic — no mention of
+    what the code is for (reset, verify, login, etc.), just a clean,
+    professional 'your requested code' layout."""
     return f"""
     <!DOCTYPE html>
     <html>
@@ -43,53 +40,41 @@ def _build_otp_email_html(
           <tr>
             <td align="center">
               <table border="0" cellpadding="0" cellspacing="0" width="100%"
-                     style="max-width: 600px; background-color:#FFFFFF; border-radius:20px; overflow:hidden; box-shadow: 0 20px 40px -15px rgba(0,0,0,0.12);">
+                     style="max-width: 600px; background-color:#FFFFFF; border-radius:12px; overflow:hidden; border: 1px solid #E5E5E5;">
 
                 <tr>
                   <td style="padding: 40px 40px 20px 40px;">
-                    <span style="font-size: 28px; font-weight: 700; color: {primary_color}; letter-spacing: -1px;">
-                      {app_name}.
+                    <span style="font-size: 24px; font-weight: 700; color: {text_color}; letter-spacing: -0.5px;">
+                      {app_name}
                     </span>
                   </td>
                 </tr>
 
                 <tr>
                   <td style="padding: 0 40px 20px 40px;">
-                    <p style="margin: 0 0 8px 0; font-size: 11px; font-weight: 500; letter-spacing: 0.18em; color: {tag_color}; text-transform: uppercase;">
-                      {eyebrow}
-                    </p>
-
-                    <h1 style="margin: 0 0 16px 0; font-size: 36px; line-height: 1.1;">
-                      <span style="font-weight: 300; color: {primary_color};">{heading_light}</span>
-                      <span style="font-weight: 700; color: {accent_color};"> {heading_bold}</span>
-                    </h1>
-
-                    <p style="margin: 0 0 32px 0; font-size: 15px; color: #1A1C20; line-height: 1.6; font-weight: 400;">
-                      {body_text}
+                    <p style="margin: 0 0 24px 0; font-size: 15px; color: {text_color}; line-height: 1.6; font-weight: 400;">
+                      Your requested code is below. This code will expire in <strong>10 minutes</strong>.
                     </p>
 
                     <table border="0" cellpadding="0" cellspacing="0" width="100%">
                       <tr>
-                        <td align="center" style="background-color: #FFFDFB; padding: 32px; border-radius: 12px; border: 2px solid {accent_color};">
-                          <span style="display: block; font-size: 12px; font-weight: 600; letter-spacing: 1px; color: {tag_color}; margin-bottom: 12px; text-transform: uppercase;">
-                            {code_label}
-                          </span>
-                          <span style="display: inline-block; font-size: 42px; font-weight: 700; letter-spacing: 12px; color: #1A1C20;">
+                        <td align="center" style="background-color: #FFFFFF; padding: 32px; border-radius: 8px; border: 1px solid {border_color};">
+                          <span style="display: inline-block; font-size: 40px; font-weight: 700; letter-spacing: 12px; color: {text_color};">
                             {code}
                           </span>
                         </td>
                       </tr>
                     </table>
 
-                    <p style="margin: 32px 0 0 0; font-size: 14px; color: {primary_color}; line-height: 1.5;">
-                      {footer_text}
+                    <p style="margin: 32px 0 0 0; font-size: 14px; color: {muted_color}; line-height: 1.5;">
+                      If you didn't request this code, you can safely ignore this email.
                     </p>
                   </td>
                 </tr>
 
                 <tr>
-                  <td align="left" style="padding: 30px 40px; background-color: #FFFFFF; border-top: 1px solid rgba(0,0,0,0.06);">
-                    <p style="margin: 0; font-size: 12px; color: {primary_color}; font-weight: 500;">
+                  <td align="left" style="padding: 30px 40px; background-color: #FFFFFF; border-top: 1px solid #E5E5E5;">
+                    <p style="margin: 0; font-size: 12px; color: {muted_color}; font-weight: 500;">
                       &copy; 2026 {app_name}. All rights reserved.
                     </p>
                   </td>
@@ -133,30 +118,20 @@ def send_reset_email(
     reset_code,
     app_name=DEFAULT_APP_NAME,
     sender_email=DEFAULT_SENDER_EMAIL,
-    primary_color=DEFAULT_PRIMARY_COLOR,
-    accent_color=DEFAULT_ACCENT_COLOR,
-    tag_color=DEFAULT_TAG_COLOR,
+    text_color=DEFAULT_TEXT_COLOR,
+    muted_color=DEFAULT_MUTED_COLOR,
+    border_color=DEFAULT_BORDER_COLOR,
     background_color=DEFAULT_BACKGROUND_COLOR,
 ):
     html = _build_otp_email_html(
         app_name=app_name,
-        eyebrow="ACCOUNT · RECOVERY",
-        heading_light="Forgot",
-        heading_bold="Password?",
-        body_text=(
-            f"We received a request to reset the password for your {app_name} account. "
-            f"Enter the secure 6-digit code below to continue. This code will expire in "
-            f"<strong>10 minutes</strong>."
-        ),
         code=reset_code,
-        code_label="Secure Reset Code",
-        footer_text="If you didn't request this action, you can safely ignore this email. Your account remains secure.",
-        primary_color=primary_color,
-        accent_color=accent_color,
-        tag_color=tag_color,
+        text_color=text_color,
+        muted_color=muted_color,
+        border_color=border_color,
         background_color=background_color,
     )
-    return _send(email, f"Your {app_name} Password Reset Code", html, app_name, sender_email)
+    return _send(email, f"Your {app_name} code", html, app_name, sender_email)
 
 
 def send_verify_email(
@@ -164,27 +139,17 @@ def send_verify_email(
     verify_code,
     app_name=DEFAULT_APP_NAME,
     sender_email=DEFAULT_SENDER_EMAIL,
-    primary_color=DEFAULT_PRIMARY_COLOR,
-    accent_color=DEFAULT_ACCENT_COLOR,
-    tag_color=DEFAULT_TAG_COLOR,
+    text_color=DEFAULT_TEXT_COLOR,
+    muted_color=DEFAULT_MUTED_COLOR,
+    border_color=DEFAULT_BORDER_COLOR,
     background_color=DEFAULT_BACKGROUND_COLOR,
 ):
     html = _build_otp_email_html(
         app_name=app_name,
-        eyebrow="SECURITY · VERIFY",
-        heading_light="Check Your",
-        heading_bold="Email",
-        body_text=(
-            f"We need to verify the email address for your {app_name} account. "
-            f"Enter the secure 6-digit code below to unlock full access. This code will expire in "
-            f"<strong>10 minutes</strong>."
-        ),
         code=verify_code,
-        code_label="Verification Code",
-        footer_text=f"If you didn't create an account with {app_name}, you can safely delete this email.",
-        primary_color=primary_color,
-        accent_color=accent_color,
-        tag_color=tag_color,
+        text_color=text_color,
+        muted_color=muted_color,
+        border_color=border_color,
         background_color=background_color,
     )
-    return _send(email, f"Verify your {app_name} Email Address", html, app_name, sender_email)
+    return _send(email, f"Your {app_name} code", html, app_name, sender_email)
