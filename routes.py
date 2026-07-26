@@ -6,6 +6,7 @@ os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
 
 import eventlet
 eventlet.monkey_patch()
+import boto3
 
 from flask import Flask, request, jsonify
 import hmac
