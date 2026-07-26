@@ -5,7 +5,7 @@ import boto3
 os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
 
 import eventlet
-eventlet.monkey_patch()
+eventlet.monkey_patch(ssl=False)
 
 from flask import Flask, request, jsonify
 import hmac
