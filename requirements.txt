@@ -13,3 +13,4 @@ eventlet==0.33.3
 gunicorn==21.2.0
 setuptools
 boto3
+urllib3<2
