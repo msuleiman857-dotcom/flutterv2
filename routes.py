@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import boto3
 os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
 
 import eventlet
@@ -32,6 +33,14 @@ from security import (
     dummy_verify, verify_password
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+r2 = boto3.client(
+    's3',
+    endpoint_url=f"https://{os.getenv('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
+    aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
+    region_name='auto',
+)
 
 NIGERIAN_BANKS = {
     "044": "Access Bank", "058": "GTBank", "033": "UBA", "057": "Zenith Bank", "011": "First Bank", 
@@ -654,30 +663,6 @@ def decline_payment():
     except Exception as e:
         logging.error(f"decline_payment error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
-
-@app.route('/api/upload-media', methods=['POST'])
-@jwt_required()
-def upload_media():
-    user_id = get_jwt_identity()
-
-    try:
-        file = request.files.get('file')
-        mime_type = request.form.get('mime_type', 'application/octet-stream')
-        ext = request.form.get('ext', 'bin')
-        if not file:
-            return jsonify({'success': False, 'message': 'No file provided'}), 400
-        unique_id = str(uuid.uuid4())
-        storage_path = f"posts/{user_id}/{unique_id}.{ext}"
-
-        bucket = storage.bucket()
-        blob = bucket.blob(storage_path)
-        blob.upload_from_string(file.read(), content_type=mime_type)
-        public_url = f"https://storage.googleapis.com/{bucket.name}/{storage_path}"
-
-        return jsonify({'success': True, 'public_url': public_url}), 200
-    except Exception as e:
-        logging.error(f"upload_media error: {e}")
-        return jsonify({'success': False, 'message': 'Internal server error'}), 500
 
 @app.route('/api/update_price', methods=['POST'])
 @jwt_required()
@@ -2579,17 +2564,19 @@ def get_upload_url():
     user_id   = get_jwt_identity()
     if not filename or not mime_type:
         return jsonify({'success': False, 'message': 'filename and mime_type required'}), 400
+
     storage_path = f"posts/{user_id}/{filename}"
     try:
-        bucket = storage.bucket()
-        blob = bucket.blob(storage_path)
-        signed_url = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=15),
-            method="PUT",
-            content_type=mime_type,
+        signed_url = r2.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': os.getenv('R2_BUCKET_NAME'),
+                'Key': storage_path,
+                'ContentType': mime_type,
+            },
+            ExpiresIn=900,
         )
-        public_url = f"https://storage.googleapis.com/{bucket.name}/{storage_path}"
+        public_url = f"{os.getenv('R2_PUBLIC_URL_BASE')}/{storage_path}"
         return jsonify({
             'success':    True,
             'signed_url': signed_url,
