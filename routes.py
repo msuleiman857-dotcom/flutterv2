@@ -1,7 +1,7 @@
 import os
 import time
 import math
-import boto3
+import eventlet.tpool
 os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
 
 import eventlet
@@ -2567,7 +2567,8 @@ def get_upload_url():
 
     storage_path = f"posts/{user_id}/{filename}"
     try:
-        signed_url = r2.generate_presigned_url(
+        signed_url = eventlet.tpool.execute(
+            r2.generate_presigned_url,
             'put_object',
             Params={
                 'Bucket': os.getenv('R2_BUCKET_NAME'),
