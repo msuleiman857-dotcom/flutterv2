@@ -63,6 +63,7 @@ NIGERIAN_BANKS = {
 load_dotenv(os.path.expanduser("~/flas/.env"))
 
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
+BRIDGE_KEY = os.getenv("BRIDGE_KEY")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "firebase")
@@ -2010,7 +2011,7 @@ def submit_bank_kyc():
     account_purpose_other = data.get('account_purpose_other') if account_purpose == 'other' else None
 
     bridge_headers = {
-        "Api-Key": os.getenv('BRIDGE_KEY'),
+        "Api-Key": BRIDGE_KEY,
         "Content-Type": "application/json"
     }
 
@@ -2196,7 +2197,7 @@ def get_bank_info():
 
         bridge_res = requests.get(
             f"https://api.bridge.xyz/v0/customers/{customer_id}/virtual_accounts",
-            headers={"Api-Key": os.getenv('BRIDGE_KEY')},
+            headers={"Api-Key": BRIDGE_KEY},
             timeout=15
         )
         bridge_data = bridge_res.json()
