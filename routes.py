@@ -2316,8 +2316,10 @@ def get_bank_info():
         return jsonify({
             "status": "success",
             "virtual_acct_id": bridge_data.get('id'),
-            "bank_info": instructions,
-            "payment_rail": bridge_data.get('destination', {}).get('payment_rail'),
+            # Pass the entire source instructions object so Flutter gets the array of rails
+            "bank_info": bridge_data.get('source_deposit_instructions', {}),
+            # Dig into destination to get the USDC address
+            "crypto_address": bridge_data.get('destination', {}).get('address')
         }), 200
  
     except requests.exceptions.RequestException as e:
