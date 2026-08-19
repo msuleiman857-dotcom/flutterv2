@@ -62,6 +62,13 @@ NIGERIAN_BANKS = {
 
 load_dotenv(os.path.expanduser("~/flas/.env"))
 
+def _supabase_headers():
+    return {
+        "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
+        "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
+        "Content-Type": "application/json",
+    }
+
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
 BRIDGE_KEY = os.getenv("BRIDGE_KEY")
 
