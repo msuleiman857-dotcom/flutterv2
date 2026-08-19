@@ -1972,8 +1972,11 @@ def api_login():
                 'id': user['id'],
                 'access_token': access_token,
                 'kyc': user.get('kyc', False),
-                'bank_no': bank_no,               # ✅ NEW
-                'bank_institution': bank_institution  # ✅ NEW
+                'bank_kyc': user.get('bank_kyc', False),        # ✅ NEW
+                'customer_id': user.get('customer_id'),          # ✅ NEW
+                'virtual_acct_id': user.get('virtual_acct_id'),  # ✅ NEW
+                'bank_no': bank_no,
+                'bank_institution': bank_institution
             }), 200
         else:
             logging.warning(f"Failed login attempt for identifier: {identifier} from IP: {client_ip}")
@@ -1984,6 +1987,242 @@ def api_login():
         import traceback
         logging.error(f"Full traceback: {traceback.format_exc()}")
         return jsonify({'status': 'error', 'message': 'An internal server error occurred'}), 500
+
+@app.route('/api/submit_bank_kyc', methods=['POST'])
+@jwt_required()
+@limiter.limit("5 per hour")
+def submit_bank_kyc():
+    user_id = get_jwt_identity()
+    data = request.get_json(silent=True) or {}
+
+    required = [
+        'first_name', 'last_name', 'email', 'phone', 'birth_date', 'nationality',
+        'most_recent_occupation', 'street_line_1', 'city', 'subdivision', 'postal_code',
+        'country', 'id_type', 'id_issuing_country', 'id_number', 'id_image_front',
+        'employment_status', 'source_of_funds', 'expected_monthly_payments_usd',
+        'acting_as_intermediary', 'account_purpose', 'signed_agreement_id', 'payment_rail'
+    ]
+    missing = [f for f in required if data.get(f) in (None, '')]
+    if missing:
+        return jsonify({"status": "error", "message": f"Missing fields: {', '.join(missing)}"}), 400
+
+    account_purpose = data.get('account_purpose')
+    account_purpose_other = data.get('account_purpose_other') if account_purpose == 'other' else None
+
+    bridge_headers = {
+        "Api-Key": os.getenv('BRIDGE_KEY'),
+        "Content-Type": "application/json"
+    }
+
+    supabase_url = os.getenv('SUPABASE_URL')
+    supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+    supabase_headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # 1. Create the Bridge customer
+        customer_payload = {
+            "type": "individual",
+            "first_name": data['first_name'],
+            "middle_name": data.get('middle_name'),
+            "last_name": data['last_name'],
+            "email": data['email'],
+            "phone": data['phone'],
+            "birth_date": data['birth_date'],
+            "signed_agreement_id": data['signed_agreement_id'],
+            "endorsements": ["base"],
+            "most_recent_occupation": data['most_recent_occupation'],
+            "nationality": data['nationality'],
+            "employment_status": data['employment_status'],
+            "source_of_funds": data['source_of_funds'],
+            "expected_monthly_payments_usd": data['expected_monthly_payments_usd'],
+            "acting_as_intermediary": data['acting_as_intermediary'],
+            "account_purpose": account_purpose,
+            "account_purpose_other": account_purpose_other,
+            "residential_address": {
+                "street_line_1": data['street_line_1'],
+                "city": data['city'],
+                "subdivision": data['subdivision'],
+                "postal_code": data['postal_code'],
+                "country": data['country']
+            },
+            "identifying_information": [{
+                "type": data['id_type'],
+                "issuing_country": data['id_issuing_country'],
+                "number": data['id_number'],
+                "image_front": data['id_image_front']
+            }]
+        }
+
+        customer_res = requests.post(
+            "https://api.bridge.xyz/v0/customers",
+            json=customer_payload,
+            headers={**bridge_headers, "Idempotency-Key": str(uuid.uuid4())},
+            timeout=30
+        )
+        customer_data = customer_res.json()
+
+        if customer_res.status_code not in (200, 201):
+            logging.error(f"Bridge customer creation failed for {user_id}: {customer_data}")
+            return jsonify({"status": "error", "message": "KYC submission failed. Please check your details."}), 400
+
+        customer_id = customer_data.get('id')
+        bridge_status = customer_data.get('status')
+
+        if bridge_status != "active":
+            # Save customer_id so we don't recreate on retry; bank_kyc stays false
+            requests.patch(
+                f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
+                headers=supabase_headers,
+                json={"customer_id": customer_id}
+            )
+            return jsonify({
+                "status": "pending",
+                "bank_kyc": False,
+                "bridge_status": bridge_status,
+                "message": "Your information is under review. We'll notify you once it's approved."
+            }), 200
+
+        # 2. Active — create a Bridge-managed wallet on the chosen chain
+        payment_rail = data['payment_rail']
+        wallet_res = requests.post(
+            f"https://api.bridge.xyz/v0/customers/{customer_id}/wallets",
+            json={"chain": payment_rail},
+            headers={**bridge_headers, "Idempotency-Key": str(uuid.uuid4())},
+            timeout=30
+        )
+        wallet_data = wallet_res.json()
+
+        if wallet_res.status_code not in (200, 201):
+            logging.error(f"Bridge wallet creation failed for {user_id}: {wallet_data}")
+            requests.patch(
+                f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
+                headers=supabase_headers,
+                json={"customer_id": customer_id}
+            )
+            return jsonify({"status": "error", "message": "Wallet creation failed. Please try again."}), 500
+
+        wallet_address = wallet_data.get('address')
+
+        # 3. Create the virtual account, routed to that wallet
+        va_res = requests.post(
+            f"https://api.bridge.xyz/v0/customers/{customer_id}/virtual_accounts",
+            json={
+                "developer_fee_percent": "5.0",
+                "source": {"currency": "usd"},
+                "destination": {
+                    "currency": "usdc",
+                    "payment_rail": payment_rail,
+                    "address": wallet_address
+                }
+            },
+            headers={**bridge_headers, "Idempotency-Key": str(uuid.uuid4())},
+            timeout=30
+        )
+        va_data = va_res.json()
+
+        if va_res.status_code not in (200, 201):
+            logging.error(f"Bridge virtual account creation failed for {user_id}: {va_data}")
+            requests.patch(
+                f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
+                headers=supabase_headers,
+                json={"customer_id": customer_id}
+            )
+            return jsonify({"status": "error", "message": "Bank account creation failed. Please try again."}), 500
+
+        virtual_acct_id = va_data.get('id')
+
+        # 4. Save everything, flip bank_kyc on
+        update_res = requests.patch(
+            f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
+            headers=supabase_headers,
+            json={
+                "customer_id": customer_id,
+                "virtual_acct_id": virtual_acct_id,
+                "bank_kyc": True
+            }
+        )
+
+        if update_res.status_code not in (200, 204):
+            logging.error(f"Failed to save bank_kyc for {user_id}: {update_res.text}")
+            return jsonify({"status": "error", "message": "Verification succeeded but failed to save. Contact support."}), 500
+
+        instructions = dict(va_data.get('source_deposit_instructions', {}))
+        instructions.pop('bank_beneficiary_address', None)  # exclude the user's own address
+
+        return jsonify({
+            "status": "success",
+            "bank_kyc": True,
+            "customer_id": customer_id,
+            "virtual_acct_id": virtual_acct_id,
+            "bank_info": instructions
+        }), 200
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Bridge KYC request error for {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Bridge service unavailable. Please try again shortly."}), 503
+    except Exception as e:
+        logging.error(f"submit_bank_kyc unexpected error for {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+@app.route('/api/bank-info', methods=['GET'])
+@jwt_required()
+def get_bank_info():
+    user_id = get_jwt_identity()
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        supabase_headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}"
+        }
+
+        user_res = requests.get(
+            f"{supabase_url}/rest/v1/users",
+            headers=supabase_headers,
+            params={"id": f"eq.{user_id}", "select": "customer_id,bank_kyc"}
+        )
+        if user_res.status_code != 200 or not user_res.json():
+            return jsonify({"status": "error", "message": "User not found"}), 404
+
+        user_row = user_res.json()[0]
+        customer_id = user_row.get('customer_id')
+
+        if not user_row.get('bank_kyc') or not customer_id:
+            return jsonify({"status": "error", "message": "Bank verification not completed"}), 403
+
+        bridge_res = requests.get(
+            f"https://api.bridge.xyz/v0/customers/{customer_id}/virtual_accounts",
+            headers={"Api-Key": os.getenv('BRIDGE_KEY')},
+            timeout=15
+        )
+        bridge_data = bridge_res.json()
+
+        if bridge_res.status_code != 200 or not bridge_data.get('data'):
+            logging.error(f"Bridge virtual account fetch failed for {user_id}: {bridge_data}")
+            return jsonify({"status": "error", "message": "Could not retrieve bank details"}), 502
+
+        account = bridge_data['data'][0]
+        instructions = dict(account.get('source_deposit_instructions', {}))
+        instructions.pop('bank_beneficiary_address', None)  # exclude the user's own address
+
+        return jsonify({
+            "status": "success",
+            "virtual_acct_id": account.get('id'),
+            "acct_status": account.get('status'),
+            "bank_info": instructions,
+            "destination": account.get('destination')
+        }), 200
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Bank info fetch error for {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Bank service unavailable"}), 503
+    except Exception as e:
+        logging.error(f"get_bank_info unexpected error for {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 
 @app.errorhandler(429)
