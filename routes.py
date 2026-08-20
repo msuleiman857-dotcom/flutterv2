@@ -2205,7 +2205,11 @@ def setup_wallet():
                 "message": "Still under review — try again shortly."
             }), 200
  
-        destination = {"currency": "usdc", "payment_rail": payment_rail}
+        RAIL_CURRENCY_OVERRIDES = {"tron": "usdt"}
+        destination = {
+            "currency": RAIL_CURRENCY_OVERRIDES.get(payment_rail, "usdc"),
+            "payment_rail": payment_rail,
+        }
  
         if wallet_type == 'external':
             destination["address"] = external_wallet_address
