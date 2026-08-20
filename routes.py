@@ -2048,7 +2048,7 @@ def bridge_tos_link():
 # ───────────────────────────────────────────────────────────
 @app.route('/api/submit_bank_kyc', methods=['POST'])
 @jwt_required()
-@limiter.limit("5 per hour")
+@limiter.limit("50 per hour")
 def submit_bank_kyc():
     user_id = get_jwt_identity()
     data = request.get_json(silent=True) or {}
