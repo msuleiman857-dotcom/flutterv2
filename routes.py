@@ -2141,6 +2141,69 @@ def submit_bank_kyc():
     except Exception as e:
         logging.error(f"submit_bank_kyc unexpected error for {user_id}: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+def _get_bridge_customer(customer_id):
+    """Live GET of a Bridge customer object. Returns (data, error_response)
+    — error_response is None on success, or a (jsonify, status) tuple to
+    return directly if the call failed."""
+    try:
+        res = requests.get(
+            f"https://api.bridge.xyz/v0/customers/{customer_id}",
+            headers={"Api-Key": BRIDGE_KEY},
+            timeout=15,
+        )
+        data = res.json()
+        if res.status_code != 200:
+            logging.error(f"Bridge customer fetch failed for {customer_id}: {data}")
+            return None, (jsonify({"status": "error", "message": "Could not check verification status."}), 502)
+        return data, None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Bridge customer fetch request error for {customer_id}: {e}")
+        return None, (jsonify({"status": "error", "message": "Bridge service unavailable. Please try again shortly."}), 503)
+
+@app.route('/api/kyc-status', methods=['GET'])
+@jwt_required()
+def get_kyc_status():
+    user_id = get_jwt_identity()
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        user_res = requests.get(
+            f"{supabase_url}/rest/v1/users",
+            headers=_supabase_headers(),
+            params={"id": f"eq.{user_id}", "select": "customer_id,bank_kyc"},
+        )
+        rows = user_res.json() if user_res.status_code == 200 else []
+        if not rows:
+            return jsonify({"status": "error", "message": "User not found"}), 404
+
+        row = rows[0]
+
+        if row.get('bank_kyc'):
+            return jsonify({"status": "success"}), 200
+
+        customer_id = row.get('customer_id')
+        if not customer_id:
+            return jsonify({"status": "not_started"}), 200
+
+        customer_data, err = _get_bridge_customer(customer_id)
+        if err:
+            return err
+
+        bridge_status = customer_data.get('status')
+
+        if bridge_status == 'active':
+            return jsonify({"status": "active"}), 200
+        elif bridge_status == 'rejected':
+            return jsonify({
+                "status": "rejected",
+                "reasons": customer_data.get('rejection_reasons', []),
+            }), 200
+        else:
+            return jsonify({"status": "pending"}), 200
+
+    except Exception as e:
+        logging.error(f"kyc-status unexpected error for {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
  
  
 # ───────────────────────────────────────────────────────────
