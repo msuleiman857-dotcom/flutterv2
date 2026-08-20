@@ -2205,7 +2205,16 @@ def setup_wallet():
                 "message": "Still under review — try again shortly."
             }), 200
  
-        destination = {"currency": "usdc", "payment_rail": payment_rail}
+        # FIX: currency must be rail-aware. Tron settles in usdt, not
+        # usdc — confirmed by the actual invalid_parameters error Bridge
+        # returned, plus Bridge's own material on USDT.trx being the
+        # standard for that rail. Every other rail we offer (including
+        # stellar — Bridge's own docs example uses usdc there) keeps usdc.
+        RAIL_CURRENCY_OVERRIDES = {"tron": "usdt"}
+        destination = {
+            "currency": RAIL_CURRENCY_OVERRIDES.get(payment_rail, "usdc"),
+            "payment_rail": payment_rail,
+        }
  
         if wallet_type == 'external':
             destination["address"] = external_wallet_address
@@ -2233,33 +2242,6 @@ def setup_wallet():
             timeout=30,
         )
         va_data = va_res.json()
- 
-        if va_res.status_code not in (200, 201):
-            logging.error(f"Bridge virtual account creation failed for {user_id}: {va_data}")
-            return jsonify({"status": "error", "message": "Bank account creation failed. Please try again."}), 500
- 
-        update_res = requests.patch(
-            f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
-            headers=supabase_headers,
-            json={"virtual_acct_id": va_data.get('id'), "bank_kyc": True},
-        )
-        if update_res.status_code not in (200, 204):
-            logging.error(f"Failed to save bank_kyc for {user_id}: {update_res.text}")
-            return jsonify({"status": "error", "message": "Setup succeeded but failed to save. Contact support."}), 500
- 
-        instructions = dict(va_data.get('source_deposit_instructions', {}))
-        instructions.pop('bank_beneficiary_address', None)
- 
-        return jsonify({
-            "status": "success",
-            "bank_kyc": True,
-            "virtual_acct_id": va_data.get('id'),
-            "bank_info": instructions,
-        }), 200
- 
-    except requests.exceptions.RequestException as e:
-        logging.error(f"setup_wallet request error for {user_id}: {e}")
-        return jsonify({"status": "error", "message": "Bridge service unavailable. Please try again shortly."}), 503
  
  
 # ───────────────────────────────────────────────────────────
