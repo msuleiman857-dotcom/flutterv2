@@ -2142,6 +2142,72 @@ def submit_bank_kyc():
         logging.error(f"submit_bank_kyc unexpected error for {user_id}: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
 
+@app.route('/api/kyc-restart', methods=['POST'])
+@jwt_required()
+def kyc_restart():
+    """Called when a rejected user taps 'Refill form'. Deletes the Bridge
+    customer record and clears local references so they can submit a
+    fresh KYC application from scratch."""
+    user_id = get_jwt_identity()
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_headers = _supabase_headers()
+
+        user_res = requests.get(
+            f"{supabase_url}/rest/v1/users",
+            headers=supabase_headers,
+            params={"id": f"eq.{user_id}", "select": "customer_id"},
+        )
+        rows = user_res.json() if user_res.status_code == 200 else []
+        if not rows:
+            return jsonify({"status": "error", "message": "User not found"}), 404
+
+        customer_id = rows[0].get('customer_id')
+
+        # Nothing to clean up — safe to call this twice without erroring.
+        if not customer_id:
+            return jsonify({"status": "success"}), 200
+
+        try:
+            delete_res = requests.delete(
+                f"https://api.bridge.xyz/v0/customers/{customer_id}",
+                headers={"Api-Key": BRIDGE_KEY},
+                timeout=15,
+            )
+            if delete_res.status_code not in (200, 202, 204):
+                logging.error(
+                    f"Bridge customer deletion failed for {user_id} "
+                    f"(customer_id={customer_id}): {delete_res.text}"
+                )
+        except requests.exceptions.RequestException as e:
+            # Log loudly but don't block clearing the local reference —
+            # a stranded local customer_id is worse for the user than an
+            # orphaned record on Bridge's side that can be cleaned up
+            # separately.
+            logging.error(
+                f"Bridge customer deletion request error for {user_id} "
+                f"(customer_id={customer_id}): {e}"
+            )
+
+        update_res = requests.patch(
+            f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
+            headers=supabase_headers,
+            json={
+                "customer_id": None,
+                "virtual_acct_id": None,
+                "bank_kyc": False,
+            },
+        )
+        if update_res.status_code not in (200, 204):
+            logging.error(f"Failed to clear kyc fields for {user_id}: {update_res.text}")
+            return jsonify({"status": "error", "message": "Could not reset your application. Please try again."}), 500
+
+        return jsonify({"status": "success"}), 200
+
+    except Exception as e:
+        logging.error(f"kyc-restart unexpected error for {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
 def _get_bridge_customer(customer_id):
     """Live GET of a Bridge customer object. Returns (data, error_response)
     — error_response is None on success, or a (jsonify, status) tuple to
