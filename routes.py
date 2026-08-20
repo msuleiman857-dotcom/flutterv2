@@ -2336,6 +2336,70 @@ def get_bank_info():
         logging.error(f"get_bank_info request error for {user_id}: {e}")
         return jsonify({"status": "error", "message": "Bridge service unavailable. Please try again shortly."}), 503
 
+@app.route('/api/wallet-balance', methods=['GET'])
+@jwt_required()
+def get_wallet_balance():
+    """Returns only the USDC balance across the user's Bridge wallet(s)."""
+    user_id = get_jwt_identity()
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_headers = _supabase_headers()
+
+        user_res = requests.get(
+            f"{supabase_url}/rest/v1/users",
+            headers=supabase_headers,
+            params={"id": f"eq.{user_id}", "select": "customer_id,bank_kyc"}
+        )
+        rows = user_res.json() if user_res.status_code == 200 else []
+        if not rows or not rows[0].get('customer_id'):
+            return jsonify({"status": "error", "message": "Complete KYC first."}), 400
+
+        if not rows[0].get('bank_kyc'):
+            return jsonify({"status": "pending", "balance": 0.0, "message": "Wallet still being set up."}), 200
+
+        customer_id = rows[0]['customer_id']
+        bridge_headers = {"Api-Key": BRIDGE_KEY}
+
+        wallets_res = requests.get(
+            f"https://api.bridge.xyz/v0/customers/{customer_id}/wallets",
+            headers=bridge_headers,
+            timeout=15
+        )
+        if wallets_res.status_code != 200:
+            logging.error(f"wallet-balance: list wallets failed for {user_id}: {wallets_res.text}")
+            return jsonify({"status": "error", "message": "Could not retrieve wallet."}), 502
+
+        wallets = wallets_res.json().get("data", [])
+        if not wallets:
+            return jsonify({"status": "success", "balance": 0.0}), 200
+
+        total_balance = 0.0
+        for wallet in wallets:
+            wallet_id = wallet.get("id")
+            detail_res = requests.get(
+                f"https://api.bridge.xyz/v0/customers/{customer_id}/wallets/{wallet_id}",
+                headers=bridge_headers,
+                timeout=15
+            )
+            if detail_res.status_code != 200:
+                logging.warning(f"wallet-balance: wallet detail failed for {wallet_id}: {detail_res.text}")
+                continue
+
+            for b in detail_res.json().get("balances", []):
+                try:
+                    total_balance += float(b.get("balance", 0))
+                except (ValueError, TypeError):
+                    pass
+
+        return jsonify({"status": "success", "balance": round(total_balance, 2)}), 200
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"wallet-balance request error for {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Bridge service unavailable. Please try again shortly."}), 503
+    except Exception as e:
+        logging.error(f"wallet-balance unexpected error for {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
