@@ -2276,7 +2276,7 @@ def get_bank_info():
     try:
         supabase_headers = _supabase_headers()
         supabase_url = os.getenv('SUPABASE_URL')
- 
+
         user_res = requests.get(
             f"{supabase_url}/rest/v1/users",
             headers=supabase_headers,
@@ -2284,11 +2284,11 @@ def get_bank_info():
         )
         if user_res.status_code != 200 or not user_res.json():
             return jsonify({"status": "error", "message": "User not found"}), 404
- 
+
         user_row = user_res.json()[0]
         customer_id = user_row.get('customer_id')
         virtual_acct_id = user_row.get('virtual_acct_id')
- 
+
         if not user_row.get('bank_kyc') or not virtual_acct_id:
             if customer_id:
                 return jsonify({
@@ -2296,36 +2296,32 @@ def get_bank_info():
                     "message": "Your account is still being verified. Check back soon."
                 }), 200
             return jsonify({"status": "error", "message": "Bank verification not completed"}), 403
- 
-        # Exactly your reference pattern: GET the specific virtual account
-        # by id straight from Bridge, nothing cached locally.
+
         bridge_res = requests.get(
             f"https://api.bridge.xyz/v0/customers/{customer_id}/virtual_accounts/{virtual_acct_id}",
             headers={"Api-Key": BRIDGE_KEY},
             timeout=15
         )
         bridge_data = bridge_res.json()
- 
+
         if bridge_res.status_code != 200:
             logging.error(f"Bridge virtual account fetch failed for {user_id}: {bridge_data}")
             return jsonify({"status": "error", "message": "Could not retrieve bank details"}), 502
- 
+
         instructions = dict(bridge_data.get('source_deposit_instructions', {}))
         instructions.pop('bank_beneficiary_address', None)
- 
+
+        destination = bridge_data.get('destination', {})
+
         return jsonify({
             "status": "success",
             "virtual_acct_id": bridge_data.get('id'),
-            # Pass the entire source instructions object so Flutter gets the array of rails
             "bank_info": instructions,
-            # Full destination block — currency, payment_rail, and address —
-            # not just the address, so the frontend can label it correctly
-            # (e.g. "USDC on Base" instead of a bare address).
             "crypto_address": destination.get('address'),
             "crypto_currency": destination.get('currency'),
             "crypto_payment_rail": destination.get('payment_rail'),
         }), 200
- 
+
     except requests.exceptions.RequestException as e:
         logging.error(f"get_bank_info request error for {user_id}: {e}")
         return jsonify({"status": "error", "message": "Bridge service unavailable. Please try again shortly."}), 503
