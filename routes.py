@@ -2337,14 +2337,16 @@ def setup_wallet():
     user_id = get_jwt_identity()
     data = request.get_json(silent=True) or {}
 
+    # Fixed — no longer user-selectable. Every wallet on this app is
+    # USDT on Tron.
+    PAYMENT_RAIL = "tron"
+    CURRENCY = "usdt"
+
     wallet_type = data.get('wallet_type')  # 'bridge' | 'external'
-    payment_rail = data.get('payment_rail')
     external_wallet_address = data.get('external_wallet_address')
 
     if wallet_type not in ('bridge', 'external'):
         return jsonify({"status": "error", "message": "wallet_type must be 'bridge' or 'external'"}), 400
-    if not payment_rail:
-        return jsonify({"status": "error", "message": "payment_rail is required"}), 400
     if wallet_type == 'external' and not external_wallet_address:
         return jsonify({"status": "error", "message": "external_wallet_address is required"}), 400
 
@@ -2371,9 +2373,6 @@ def setup_wallet():
     bridge_headers = {"Api-Key": BRIDGE_KEY, "Content-Type": "application/json"}
 
     try:
-        # bank_kyc being true already guarantees Bridge status is active,
-        # but a defensive live check costs little and protects against
-        # any edge-case status flip between kyc-status and this call.
         status_res = requests.get(
             f"https://api.bridge.xyz/v0/customers/{customer_id}",
             headers={"Api-Key": BRIDGE_KEY},
@@ -2391,10 +2390,9 @@ def setup_wallet():
                 "message": "Your verification status changed — please refresh and try again."
             }), 409
 
-        RAIL_CURRENCY_OVERRIDES = {"tron": "usdt"}
         destination = {
-            "currency": RAIL_CURRENCY_OVERRIDES.get(payment_rail, "usdc"),
-            "payment_rail": payment_rail,
+            "currency": CURRENCY,
+            "payment_rail": PAYMENT_RAIL,
         }
 
         if wallet_type == 'external':
@@ -2402,7 +2400,7 @@ def setup_wallet():
         else:
             wallet_res = requests.post(
                 f"https://api.bridge.xyz/v0/customers/{customer_id}/wallets",
-                json={"chain": payment_rail},
+                json={"chain": PAYMENT_RAIL},
                 headers={**bridge_headers, "Idempotency-Key": str(uuid.uuid4())},
                 timeout=30,
             )
