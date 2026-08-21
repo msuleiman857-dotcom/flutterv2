@@ -25,7 +25,7 @@ from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, messaging, storage
 from firebase_admin import auth as firebase_auth
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
 from cryptography.fernet import Fernet
 import uuid    
 from security import (
@@ -144,6 +144,46 @@ def handle_disconnect():
 @app.route('/')
 def health():
     return jsonify({"status": "hack me if you can"}), 200
+
+@jwt.token_in_blocklist_loader
+def check_if_token_revoked(jwt_header, jwt_payload):
+    jti = jwt_payload["jti"]
+    try:
+        res = requests.get(
+            f"{os.getenv('SUPABASE_URL')}/rest/v1/revoked_tokens",
+            headers=_supabase_headers(),
+            params={"jti": f"eq.{jti}", "select": "jti"},
+            timeout=5,
+        )
+        return res.status_code == 200 and len(res.json()) > 0
+    except requests.exceptions.RequestException:
+        # Supabase hiccup shouldn't lock every logged-in user out of the
+        # entire app — fail open (treat as not-revoked) rather than closed.
+        return False
+
+@app.route('/api/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    user_id = get_jwt_identity()
+    jwt_data = get_jwt()
+    jti = jwt_data["jti"]
+    expires_at = datetime.fromtimestamp(jwt_data["exp"], tz=timezone.utc).isoformat()
+
+    try:
+        res = requests.post(
+            f"{os.getenv('SUPABASE_URL')}/rest/v1/revoked_tokens",
+            headers=_supabase_headers(),
+            json={"jti": jti, "expires_at": expires_at},
+            timeout=10,
+        )
+        if res.status_code not in (200, 201):
+            logging.error(f"Failed to revoke token for {user_id}: {res.text}")
+            return jsonify({"status": "error", "message": "Logout failed. Please try again."}), 500
+
+        return jsonify({"status": "success", "message": "Logged out."}), 200
+    except requests.exceptions.RequestException as e:
+        logging.error(f"logout request error for {user_id}: {e}")
+        return jsonify({"status": "error", "message": "Logout failed. Please try again."}), 500
 
 @app.route('/api/firebase-token', methods=['GET'])
 @jwt_required()
