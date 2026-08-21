@@ -2298,6 +2298,20 @@ def get_kyc_status():
         bridge_status = customer_data.get('status')
 
         if bridge_status == 'active':
+            # bank_kyc now means "identity verified" ONLY — wallet setup
+            # is a separate, user-initiated step from the dashboard.
+            # Flip it here, the moment Bridge confirms, rather than
+            # waiting on setup_wallet to do it later.
+            update_res = requests.patch(
+                f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
+                headers=_supabase_headers(),
+                json={"bank_kyc": True},
+            )
+            if update_res.status_code not in (200, 204):
+                logging.error(f"kyc-status: failed to set bank_kyc for {user_id}: {update_res.text}")
+                # Bridge is genuinely active — don't strand the user on
+                # a false "pending" just because this write failed. The
+                # next poll will retry the same PATCH.
             return jsonify({"status": "active"}), 200
         elif bridge_status == 'rejected':
             return jsonify({
@@ -2311,7 +2325,6 @@ def get_kyc_status():
         logging.error(f"kyc-status unexpected error for {user_id}: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
  
- 
 # ───────────────────────────────────────────────────────────
 # 3. setup_wallet — call right after submit_bank_kyc. Safe to call
 #    repeatedly (e.g. retried from the Receive page) — it's a live check
@@ -2323,63 +2336,67 @@ def get_kyc_status():
 def setup_wallet():
     user_id = get_jwt_identity()
     data = request.get_json(silent=True) or {}
- 
+
     wallet_type = data.get('wallet_type')  # 'bridge' | 'external'
     payment_rail = data.get('payment_rail')
     external_wallet_address = data.get('external_wallet_address')
- 
+
     if wallet_type not in ('bridge', 'external'):
         return jsonify({"status": "error", "message": "wallet_type must be 'bridge' or 'external'"}), 400
     if not payment_rail:
         return jsonify({"status": "error", "message": "payment_rail is required"}), 400
     if wallet_type == 'external' and not external_wallet_address:
         return jsonify({"status": "error", "message": "external_wallet_address is required"}), 400
- 
+
     supabase_headers = _supabase_headers()
     supabase_url = os.getenv('SUPABASE_URL')
- 
+
     user_res = requests.get(
         f"{supabase_url}/rest/v1/users",
         headers=supabase_headers,
-        params={"id": f"eq.{user_id}", "select": "customer_id,bank_kyc"},
+        params={"id": f"eq.{user_id}", "select": "customer_id,bank_kyc,virtual_acct_id"},
     )
     rows = user_res.json() if user_res.status_code == 200 else []
     if not rows or not rows[0].get('customer_id'):
-        return jsonify({"status": "error", "message": "Submit your KYC details first."}), 400
- 
-    if rows[0].get('bank_kyc'):
+        return jsonify({"status": "error", "message": "Complete identity verification first."}), 400
+
+    if not rows[0].get('bank_kyc'):
+        return jsonify({"status": "error", "message": "Identity verification isn't complete yet."}), 400
+
+    # Idempotent — a wallet already exists, nothing more to do.
+    if rows[0].get('virtual_acct_id'):
         return jsonify({"status": "success", "message": "Already set up."}), 200
- 
+
     customer_id = rows[0]['customer_id']
     bridge_headers = {"Api-Key": BRIDGE_KEY, "Content-Type": "application/json"}
- 
+
     try:
-        # Live check — this is the only source of truth for status, same
-        # as get_bank_info already relies on Bridge live rather than a
-        # cached flag.
+        # bank_kyc being true already guarantees Bridge status is active,
+        # but a defensive live check costs little and protects against
+        # any edge-case status flip between kyc-status and this call.
         status_res = requests.get(
             f"https://api.bridge.xyz/v0/customers/{customer_id}",
             headers={"Api-Key": BRIDGE_KEY},
             timeout=15,
         )
         status_data = status_res.json()
- 
+
         if status_res.status_code != 200:
             logging.error(f"setup_wallet: status check failed for {user_id}: {status_data}")
             return jsonify({"status": "error", "message": "Could not check verification status."}), 502
- 
+
         if status_data.get('status') != 'active':
             return jsonify({
-                "status": "pending",
-                "message": "Still under review — try again shortly."
-            }), 200
- 
+                "status": "error",
+                "message": "Your verification status changed — please refresh and try again."
+            }), 409
+
         RAIL_CURRENCY_OVERRIDES = {"tron": "usdt"}
         destination = {
             "currency": RAIL_CURRENCY_OVERRIDES.get(payment_rail, "usdc"),
             "payment_rail": payment_rail,
         }
- 
+
         if wallet_type == 'external':
             destination["address"] = external_wallet_address
         else:
@@ -2394,7 +2411,7 @@ def setup_wallet():
                 logging.error(f"Bridge wallet creation failed for {user_id}: {wallet_data}")
                 return jsonify({"status": "error", "message": "Wallet creation failed. Please try again."}), 500
             destination["bridge_wallet_id"] = wallet_data.get('id')
- 
+
         va_res = requests.post(
             f"https://api.bridge.xyz/v0/customers/{customer_id}/virtual_accounts",
             json={
@@ -2406,30 +2423,29 @@ def setup_wallet():
             timeout=30,
         )
         va_data = va_res.json()
- 
+
         if va_res.status_code not in (200, 201):
             logging.error(f"Bridge virtual account creation failed for {user_id}: {va_data}")
             return jsonify({"status": "error", "message": "Bank account creation failed. Please try again."}), 500
- 
+
         update_res = requests.patch(
             f"{supabase_url}/rest/v1/users?id=eq.{user_id}",
             headers=supabase_headers,
-            json={"virtual_acct_id": va_data.get('id'), "bank_kyc": True},
+            json={"virtual_acct_id": va_data.get('id')},
         )
         if update_res.status_code not in (200, 204):
-            logging.error(f"Failed to save bank_kyc for {user_id}: {update_res.text}")
+            logging.error(f"Failed to save virtual_acct_id for {user_id}: {update_res.text}")
             return jsonify({"status": "error", "message": "Setup succeeded but failed to save. Contact support."}), 500
- 
+
         instructions = dict(va_data.get('source_deposit_instructions', {}))
         instructions.pop('bank_beneficiary_address', None)
- 
+
         return jsonify({
             "status": "success",
-            "bank_kyc": True,
             "virtual_acct_id": va_data.get('id'),
             "bank_info": instructions,
         }), 200
- 
+
     except requests.exceptions.RequestException as e:
         logging.error(f"setup_wallet request error for {user_id}: {e}")
         return jsonify({"status": "error", "message": "Bridge service unavailable. Please try again shortly."}), 503
@@ -2449,58 +2465,52 @@ def get_bank_info():
     try:
         supabase_headers = _supabase_headers()
         supabase_url = os.getenv('SUPABASE_URL')
- 
+
         user_res = requests.get(
             f"{supabase_url}/rest/v1/users",
             headers=supabase_headers,
-            params={"id": f"eq.{user_id}", "select": "customer_id,virtual_acct_id,bank_kyc"}
+            params={"id": f"eq.{user_id}", "select": "customer_id,virtual_acct_id"}
         )
         if user_res.status_code != 200 or not user_res.json():
             return jsonify({"status": "error", "message": "User not found"}), 404
- 
+
         user_row = user_res.json()[0]
         customer_id = user_row.get('customer_id')
         virtual_acct_id = user_row.get('virtual_acct_id')
- 
-        if not user_row.get('bank_kyc') or not virtual_acct_id:
-            if customer_id:
-                return jsonify({
-                    "status": "pending",
-                    "message": "Your account is still being verified. Check back soon."
-                }), 200
-            return jsonify({"status": "error", "message": "Bank verification not completed"}), 403
- 
-        # Exactly your reference pattern: GET the specific virtual account
-        # by id straight from Bridge, nothing cached locally.
+
+        # No wallet yet — a distinct state from "still under KYC review"
+        # now that bank_kyc no longer implies a wallet exists.
+        if not virtual_acct_id:
+            return jsonify({
+                "status": "no_wallet",
+                "message": "You haven't set up your receiving account yet."
+            }), 200
+
         bridge_res = requests.get(
             f"https://api.bridge.xyz/v0/customers/{customer_id}/virtual_accounts/{virtual_acct_id}",
             headers={"Api-Key": BRIDGE_KEY},
             timeout=15
         )
         bridge_data = bridge_res.json()
- 
+
         if bridge_res.status_code != 200:
             logging.error(f"Bridge virtual account fetch failed for {user_id}: {bridge_data}")
             return jsonify({"status": "error", "message": "Could not retrieve bank details"}), 502
- 
+
         instructions = dict(bridge_data.get('source_deposit_instructions', {}))
         instructions.pop('bank_beneficiary_address', None)
 
-        destination = bridge_data.get('destination', {})  
- 
+        destination = bridge_data.get('destination', {})
+
         return jsonify({
-           "status": "success",
+            "status": "success",
             "virtual_acct_id": bridge_data.get('id'),
-            # Pass the entire source instructions object so Flutter gets the array of rails
             "bank_info": instructions,
-            # Full destination block — currency, payment_rail, and address —
-            # not just the address, so the frontend can label it correctly
-            # (e.g. "USDC on Base" instead of a bare address).
             "crypto_address": destination.get('address'),
             "crypto_currency": destination.get('currency'),
             "crypto_payment_rail": destination.get('payment_rail'),
         }), 200
- 
+
     except requests.exceptions.RequestException as e:
         logging.error(f"get_bank_info request error for {user_id}: {e}")
         return jsonify({"status": "error", "message": "Bridge service unavailable. Please try again shortly."}), 503
@@ -2508,7 +2518,6 @@ def get_bank_info():
 @app.route('/api/wallet-balance', methods=['GET'])
 @jwt_required()
 def get_wallet_balance():
-    """Returns only the USDC balance across the user's Bridge wallet(s)."""
     user_id = get_jwt_identity()
     try:
         supabase_url = os.getenv('SUPABASE_URL')
@@ -2517,14 +2526,14 @@ def get_wallet_balance():
         user_res = requests.get(
             f"{supabase_url}/rest/v1/users",
             headers=supabase_headers,
-            params={"id": f"eq.{user_id}", "select": "customer_id,bank_kyc"}
+            params={"id": f"eq.{user_id}", "select": "customer_id,virtual_acct_id"}
         )
         rows = user_res.json() if user_res.status_code == 200 else []
         if not rows or not rows[0].get('customer_id'):
-            return jsonify({"status": "error", "message": "Complete KYC first."}), 400
+            return jsonify({"status": "error", "message": "Complete identity verification first."}), 400
 
-        if not rows[0].get('bank_kyc'):
-            return jsonify({"status": "pending", "balance": 0.0, "message": "Wallet still being set up."}), 200
+        if not rows[0].get('virtual_acct_id'):
+            return jsonify({"status": "no_wallet", "balance": 0.0, "message": "Set up your receiving account first."}), 200
 
         customer_id = rows[0]['customer_id']
         bridge_headers = {"Api-Key": BRIDGE_KEY}
@@ -2568,7 +2577,6 @@ def get_wallet_balance():
     except Exception as e:
         logging.error(f"wallet-balance unexpected error for {user_id}: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
-
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
