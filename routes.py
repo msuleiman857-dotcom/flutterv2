@@ -2337,11 +2337,6 @@ def setup_wallet():
     user_id = get_jwt_identity()
     data = request.get_json(silent=True) or {}
 
-    # Fixed — no longer user-selectable. Every wallet on this app is
-    # USDT on Tron.
-    PAYMENT_RAIL = "tron"
-    CURRENCY = "usdt"
-
     wallet_type = data.get('wallet_type')  # 'bridge' | 'external'
     external_wallet_address = data.get('external_wallet_address')
 
@@ -2349,6 +2344,17 @@ def setup_wallet():
         return jsonify({"status": "error", "message": "wallet_type must be 'bridge' or 'external'"}), 400
     if wallet_type == 'external' and not external_wallet_address:
         return jsonify({"status": "error", "message": "external_wallet_address is required"}), 400
+
+    # Chain/currency depend on which wallet path the user picked —
+    # Bridge-managed wallets are USDT on Tron (cheap, low minimum),
+    # external wallets are USDC on Base (EVM, so it also accepts
+    # centralized exchange withdrawal addresses).
+    if wallet_type == 'external':
+        payment_rail = "base"
+        currency = "usdc"
+    else:
+        payment_rail = "tron"
+        currency = "usdt"
 
     supabase_headers = _supabase_headers()
     supabase_url = os.getenv('SUPABASE_URL')
@@ -2391,8 +2397,8 @@ def setup_wallet():
             }), 409
 
         destination = {
-            "currency": CURRENCY,
-            "payment_rail": PAYMENT_RAIL,
+            "currency": currency,
+            "payment_rail": payment_rail,
         }
 
         if wallet_type == 'external':
@@ -2400,7 +2406,7 @@ def setup_wallet():
         else:
             wallet_res = requests.post(
                 f"https://api.bridge.xyz/v0/customers/{customer_id}/wallets",
-                json={"chain": PAYMENT_RAIL},
+                json={"chain": payment_rail},
                 headers={**bridge_headers, "Idempotency-Key": str(uuid.uuid4())},
                 timeout=30,
             )
