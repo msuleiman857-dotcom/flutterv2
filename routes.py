@@ -2349,12 +2349,8 @@ def setup_wallet():
     # Bridge-managed wallets are USDT on Tron (cheap, low minimum),
     # external wallets are USDC on Base (EVM, so it also accepts
     # centralized exchange withdrawal addresses).
-    if wallet_type == 'external':
-        payment_rail = "base"
-        currency = "usdc"
-    else:
-        payment_rail = "tron"
-        currency = "usdt"
+    payment_rail = "base"
+    currency = "usdc"
 
     supabase_headers = _supabase_headers()
     supabase_url = os.getenv('SUPABASE_URL')
