@@ -34,6 +34,29 @@ from security import (
     dummy_verify, verify_password
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.exceptions import InvalidSignature
+
+WEBHOOK_PUBLIC_KEY = os.getenv("WEBHOOK_PUBLIC_KEY")
+
+def verify_webhook_signature(payload, signature_header, public_key_pem):
+    try:
+        parts = signature_header.split(',')
+        timestamp = next((p.split('=', 1)[1] for p in parts if p.startswith('t=')), None)
+        signature = next((p.split('=', 1)[1] for p in parts if p.startswith('v0=')), None)
+        if not timestamp or not signature:
+            return False
+        if int(time.time() * 1000) - int(timestamp) > 600000:
+            return False
+        signed_payload = f"{timestamp}.{payload.decode()}"
+        digest = hashlib.sha256(signed_payload.encode()).digest()
+        public_key = serialization.load_pem_public_key(public_key_pem.encode())
+        public_key.verify(base64.b64decode(signature), digest, padding.PKCS1v15(), hashes.SHA256())
+        return True
+    except InvalidSignature:
+        return False
 
 r2 = boto3.client(
     's3',
@@ -143,7 +166,11 @@ def handle_disconnect():
 
 @app.route('/')
 def health():
-    return jsonify({"status": "hack me if you can"}), 200
+    return jsonify({"status": "haha"}), 200
+
+@app.route('/webhook/bridge')
+def bridge():
+    return jsonify({"status": "hehe"}), 200
 
 @jwt.token_in_blocklist_loader
 def check_if_token_revoked(jwt_header, jwt_payload):
