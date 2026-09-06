@@ -168,9 +168,63 @@ def handle_disconnect():
 def health():
     return jsonify({"status": "haha"}), 200
 
-@app.route('/webhook/bridge')
+def _find_user_id_by_customer_id(customer_id):
+    if not customer_id:
+        return None
+    try:
+        res = requests.get(
+            f"{os.getenv('SUPABASE_URL')}/rest/v1/users",
+            headers=_supabase_headers(),
+            params={"customer_id": f"eq.{customer_id}", "select": "id"},
+            timeout=10,
+        )
+        rows = res.json() if res.status_code == 200 else []
+        return rows[0]['id'] if rows else None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"bridge webhook: user lookup failed for customer_id {customer_id}: {e}")
+        return None
+
+
+@app.route('/webhook/bridge', methods=['POST'])
 def bridge():
-    return jsonify({"status": "hehe"}), 200
+    raw_body = request.get_data()
+    signature_header = request.headers.get('X-Webhook-Signature', '')
+
+    if not WEBHOOK_PUBLIC_KEY or not signature_header or \
+            not verify_webhook_signature(raw_body, signature_header, WEBHOOK_PUBLIC_KEY):
+        logging.warning("bridge webhook: signature verification failed")
+        return jsonify({"status": "error", "message": "Invalid signature"}), 400
+
+    try:
+        payload = json.loads(raw_body.decode())
+    except (ValueError, UnicodeDecodeError):
+        return jsonify({"status": "error", "message": "Invalid payload"}), 400
+
+    event_category = payload.get('event_category')
+    event_object = payload.get('event_object') or {}
+
+    if event_category == 'bridge_wallet.activity':
+        available_balance = event_object.get('available_balance')
+        customer_id = (event_object.get('payment_route') or {}).get('customer_id')
+        user_id = _find_user_id_by_customer_id(customer_id)
+
+        if user_id and available_balance is not None:
+            try:
+                requests.patch(
+                    f"{os.getenv('SUPABASE_URL')}/rest/v1/users?id=eq.{user_id}",
+                    headers=_supabase_headers(),
+                    json={"balance": available_balance},
+                    timeout=10,
+                )
+            except requests.exceptions.RequestException as e:
+                logging.error(f"bridge webhook: balance update failed for {user_id}: {e}")
+
+            if user_id in active_users:
+                socketio.emit('wallet_balance_updated', {"balance": available_balance}, room=active_users[user_id])
+        else:
+            logging.warning(f"bridge webhook: could not resolve user for customer_id={customer_id}")
+
+    return jsonify({"status": "received"}), 200
 
 @jwt.token_in_blocklist_loader
 def check_if_token_revoked(jwt_header, jwt_payload):
@@ -2549,58 +2603,23 @@ def get_wallet_balance():
     try:
         supabase_url = os.getenv('SUPABASE_URL')
         supabase_headers = _supabase_headers()
-
         user_res = requests.get(
             f"{supabase_url}/rest/v1/users",
             headers=supabase_headers,
-            params={"id": f"eq.{user_id}", "select": "customer_id,virtual_acct_id"}
+            params={"id": f"eq.{user_id}", "select": "customer_id,virtual_acct_id,balance"}
         )
         rows = user_res.json() if user_res.status_code == 200 else []
         if not rows or not rows[0].get('customer_id'):
             return jsonify({"status": "error", "message": "Complete identity verification first."}), 400
-
         if not rows[0].get('virtual_acct_id'):
             return jsonify({"status": "no_wallet", "balance": 0.0, "message": "Set up your receiving account first."}), 200
 
-        customer_id = rows[0]['customer_id']
-        bridge_headers = {"Api-Key": BRIDGE_KEY}
-
-        wallets_res = requests.get(
-            f"https://api.bridge.xyz/v0/customers/{customer_id}/wallets",
-            headers=bridge_headers,
-            timeout=15
-        )
-        if wallets_res.status_code != 200:
-            logging.error(f"wallet-balance: list wallets failed for {user_id}: {wallets_res.text}")
-            return jsonify({"status": "error", "message": "Could not retrieve wallet."}), 502
-
-        wallets = wallets_res.json().get("data", [])
-        if not wallets:
-            return jsonify({"status": "success", "balance": 0.0}), 200
-
-        total_balance = 0.0
-        for wallet in wallets:
-            wallet_id = wallet.get("id")
-            detail_res = requests.get(
-                f"https://api.bridge.xyz/v0/customers/{customer_id}/wallets/{wallet_id}",
-                headers=bridge_headers,
-                timeout=15
-            )
-            if detail_res.status_code != 200:
-                logging.warning(f"wallet-balance: wallet detail failed for {wallet_id}: {detail_res.text}")
-                continue
-
-            for b in detail_res.json().get("balances", []):
-                try:
-                    total_balance += float(b.get("balance", 0))
-                except (ValueError, TypeError):
-                    pass
-
-        return jsonify({"status": "success", "balance": round(total_balance, 2)}), 200
+        balance = rows[0].get('balance') or 0.0
+        return jsonify({"status": "success", "balance": round(float(balance), 2)}), 200
 
     except requests.exceptions.RequestException as e:
         logging.error(f"wallet-balance request error for {user_id}: {e}")
-        return jsonify({"status": "error", "message": "Bridge service unavailable. Please try again shortly."}), 503
+        return jsonify({"status": "error", "message": "Service unavailable. Please try again shortly."}), 503
     except Exception as e:
         logging.error(f"wallet-balance unexpected error for {user_id}: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
