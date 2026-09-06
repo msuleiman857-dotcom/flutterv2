@@ -189,7 +189,6 @@ def _find_user_id_by_customer_id(customer_id):
 def bridge():
     raw_body = request.get_data()
     signature_header = request.headers.get('X-Webhook-Signature', '')
-
     if not WEBHOOK_PUBLIC_KEY or not signature_header or \
             not verify_webhook_signature(raw_body, signature_header, WEBHOOK_PUBLIC_KEY):
         logging.warning("bridge webhook: signature verification failed")
@@ -218,13 +217,46 @@ def bridge():
                 )
             except requests.exceptions.RequestException as e:
                 logging.error(f"bridge webhook: balance update failed for {user_id}: {e}")
-
-            if user_id in active_users:
-                socketio.emit('wallet_balance_updated', {"balance": available_balance}, room=active_users[user_id])
         else:
             logging.warning(f"bridge webhook: could not resolve user for customer_id={customer_id}")
 
     return jsonify({"status": "received"}), 200
+
+@app.route('/api/webhook/balance-update', methods=['POST'])
+def supabase_balance_webhook():
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "error", "message": "No payload received"}), 400
+
+    print("DEBUG: Supabase balance webhook payload received:", data)
+
+    record = data.get('record')
+    old_record = data.get('old_record')
+
+    if not record:
+        return jsonify({"status": "error", "message": "No record found in payload"}), 400
+
+    new_balance = record.get('balance')
+    old_balance = (old_record or {}).get('balance')
+
+    # users gets updated for lots of reasons (profile pic, fcm_token, kyc,
+    # etc) — only broadcast when balance actually moved.
+    if new_balance == old_balance:
+        return jsonify({"status": "ignored", "message": "Balance unchanged"}), 200
+
+    user_id = record.get('id')
+
+    print(f"DEBUG: Broadcast to App -> User: {user_id} balance now {new_balance}")
+
+    socketio.emit(
+        'balance_updated',
+        {
+            'user_id': str(user_id),
+            'balance': new_balance,
+        }
+    )
+
+    return jsonify({"status": "success", "balance": new_balance}), 200
 
 @jwt.token_in_blocklist_loader
 def check_if_token_revoked(jwt_header, jwt_payload):
