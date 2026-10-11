@@ -185,381 +185,222 @@ def _find_user_id_by_customer_id(customer_id):
         return None
 
 # =====================================================================
-# SOCIAL STATS: X / Instagram / TikTok OAuth -> followers + engagement
+# SOCIAL STATS (X / Instagram / TikTok) - your original flow, fitted to routes.py
 #
-# 1) Add these to your imports at the top of routes.py:
+# 1) Add these to the imports at the top of routes.py:
 #       import secrets
 #       from urllib.parse import urlencode
-#       from flask import redirect          # (extend your existing flask import)
+#       from flask import redirect, session, abort, Response   (extend your flask import)
 #
-# 2) Paste everything below anywhere after `fernet`, `limiter` and
-#    `_supabase_headers` are defined (e.g. just before the final routes).
+# 2) Paste everything below anywhere after `app` is created.
 #
-# 3) Env vars (Render): APP_BASE_URL (already exists, must be
-#    https://flutterv2.onrender.com), X_CLIENT_ID, X_CLIENT_SECRET,
-#    IG_APP_ID, IG_APP_SECRET, TT_CLIENT_KEY, TT_CLIENT_SECRET
-#    Optional: SOCIAL_APP_DEEPLINK (e.g. myapp://social) to bounce the user
-#    back into the Flutter app after connecting.
+# 3) Env vars on Render: see social_env_vars.txt
 #
-# 4) Run the SQL at the bottom once in the Supabase SQL editor.
+# Pages:  https://flutterv2.onrender.com/social   <- list of socials to connect
 # =====================================================================
 SOCIAL_PLATFORMS = ("x", "instagram", "tiktok")
 SOCIAL_N_POSTS = 20  # how many recent posts to average over
 IG_VER = "v25.0"
 
 X_CLIENT_ID = os.getenv("X_CLIENT_ID")
-X_CLIENT_SECRET = os.getenv("X_CLIENT_SECRET", "")  # empty if public client
+X_CLIENT_SECRET = os.getenv("X_CLIENT_SECRET", "")  # "" if public client
 IG_APP_ID = os.getenv("IG_APP_ID")
 IG_APP_SECRET = os.getenv("IG_APP_SECRET")
 TT_CLIENT_KEY = os.getenv("TT_CLIENT_KEY")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET")
 
+SOCIAL_TOKENS = {}  # {(uid, platform): token dict}. In-memory; lost on restart.
 
-def _social_callback_url(platform):
+
+def social_callback_url(platform):
     return f"{os.getenv('APP_BASE_URL', '').rstrip('/')}/callback/{platform}"
 
 
-def _social_json(resp):
+def social_engagement_rate(interactions, denominator):
+    """Average interactions per post divided by followers, as a percent."""
+    if not interactions or not denominator:
+        return None
+    return round(sum(interactions) / len(interactions) / denominator * 100, 3)
+
+
+def social_go(url):
+    """Redirect to the auth URL. Add ?debug=1 to see the URL instead of leaving."""
+    print("AUTH URL:", url)
+    if request.args.get("debug"):
+        return Response(url, mimetype="text/plain")
+    return redirect(url)
+
+
+def social_get_json(resp):
     """Parse a response and raise a readable error if the API rejected us."""
     try:
         data = resp.json()
     except ValueError:
         raise RuntimeError(f"Non-JSON response ({resp.status_code}): {resp.text[:300]}")
     err = data.get("error") if isinstance(data, dict) else None
-    tiktok_err = isinstance(err, dict) and err.get("code") not in (None, "ok")
-    if resp.status_code >= 400 or tiktok_err or (
-            err and "access_token" not in data and "data" not in data):
+    tiktok_ok = isinstance(err, dict) and err.get("code") in (None, "ok")
+    if resp.status_code >= 400 or (err and not tiktok_ok and "access_token" not in data
+                                   and "data" not in data) \
+            or (isinstance(err, dict) and not tiktok_ok):
         raise RuntimeError(f"API error {resp.status_code}: {data}")
     return data
 
 
-def _social_engagement_rate(interactions, followers):
-    """Average interactions per post divided by followers, as a percent."""
-    if not interactions or not followers:
-        return None
-    return round(sum(interactions) / len(interactions) / followers * 100, 3)
+@app.errorhandler(RuntimeError)
+def social_handle_api_error(e):
+    return jsonify(error=str(e)), 502
 
 
-# ---- state: encrypted + expiring, so no server-side session is needed ----
-def _social_make_state(user_id, platform, verifier=None):
-    payload = json.dumps({"u": str(user_id), "p": platform, "v": verifier})
-    return fernet.encrypt(payload.encode()).decode()
+# ------------------------------------------------------------ links page
+@app.route("/social")
+def social_home():
+    links = "".join(
+        f'<li><a href="/connect/{p}">Connect {p}</a> | '
+        f'<a href="/stats/{p}">View {p} stats</a></li>' for p in SOCIAL_PLATFORMS)
+    uris = "".join(f"<li><code>{social_callback_url(p)}</code></li>" for p in SOCIAL_PLATFORMS)
+    return (f"<h2>Social stats</h2><ul>{links}</ul>"
+            f"<p>Redirect URIs to register in each developer portal:</p><ul>{uris}</ul>")
 
 
-def _social_read_state(state, platform):
-    try:
-        data = json.loads(fernet.decrypt(state.encode(), ttl=600))  # 10 min
-    except Exception:
-        return None
-    return data if data.get("p") == platform else None
-
-
-# ---- token storage (Supabase, encrypted with your existing Fernet key) ----
-def _social_save(user_id, platform, tok, account_id=None):
-    expires_in = tok.get("expires_in")
-    row = {
-        "user_id": str(user_id),
-        "platform": platform,
-        "account_id": account_id,
-        "token_data": fernet.encrypt(json.dumps(tok).encode()).decode(),
-        "expires_at": int(time.time()) + int(expires_in) if expires_in else None,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    res = requests.post(
-        f"{os.getenv('SUPABASE_URL')}/rest/v1/social_connections?on_conflict=user_id,platform",
-        headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
-        json=row, timeout=10)
-    if res.status_code not in (200, 201, 204):
-        logging.error(f"social save failed: {res.text}")
-        return False
-    return True
-
-
-def _social_load(user_id, platform):
-    res = requests.get(
-        f"{os.getenv('SUPABASE_URL')}/rest/v1/social_connections",
-        headers=_supabase_headers(),
-        params={"user_id": f"eq.{user_id}", "platform": f"eq.{platform}", "select": "*"},
-        timeout=10)
-    rows = res.json() if res.status_code == 200 else []
-    if not rows:
-        return None, None
-    row = rows[0]
-    try:
-        return row, json.loads(fernet.decrypt(row["token_data"].encode()))
-    except Exception:
-        logging.error(f"social token decrypt failed for {user_id}/{platform}")
-        return None, None
-
-
-def _social_delete(platform, user_id=None, account_id=None):
-    params = {"platform": f"eq.{platform}"}
-    if user_id:
-        params["user_id"] = f"eq.{user_id}"
-    if account_id:
-        params["account_id"] = f"eq.{account_id}"
-    requests.delete(f"{os.getenv('SUPABASE_URL')}/rest/v1/social_connections",
-                    headers=_supabase_headers(), params=params, timeout=10)
-
-
-# ---- OAuth exchange / refresh ----
-def _social_exchange(platform, code, verifier):
-    """Swap the auth code for tokens. Returns (token_dict, account_id)."""
-    cb = _social_callback_url(platform)
-
-    if platform == "x":
-        data = dict(grant_type="authorization_code", code=code, redirect_uri=cb,
-                    code_verifier=verifier, client_id=X_CLIENT_ID)
-        auth = (X_CLIENT_ID, X_CLIENT_SECRET) if X_CLIENT_SECRET else None
-        tok = _social_json(requests.post("https://api.x.com/2/oauth2/token",
-                                         data=data, auth=auth, timeout=30))
-        return tok, None
-
-    if platform == "instagram":
-        short = _social_json(requests.post(
-            "https://api.instagram.com/oauth/access_token",
-            data=dict(client_id=IG_APP_ID, client_secret=IG_APP_SECRET,
-                      grant_type="authorization_code", redirect_uri=cb, code=code),
-            timeout=30))
-        short = short.get("data", [short])[0]  # some versions wrap the result
-        # Swap the 1-hour token for a 60-day token (must be done server-side)
-        tok = _social_json(requests.get(
-            "https://graph.instagram.com/access_token",
-            params=dict(grant_type="ig_exchange_token", client_secret=IG_APP_SECRET,
-                        access_token=short["access_token"]), timeout=30))
-        return tok, str(short.get("user_id") or "") or None
-
-    tok = _social_json(requests.post(
-        "https://open.tiktokapis.com/v2/oauth/token/",
-        data=dict(client_key=TT_CLIENT_KEY, client_secret=TT_CLIENT_SECRET, code=code,
-                  grant_type="authorization_code", redirect_uri=cb), timeout=30))
-    return tok, tok.get("open_id")
-
-
-def _social_refresh(platform, tok):
-    """Returns a fresh token dict (merged with the old one)."""
-    if platform == "x":
-        auth = (X_CLIENT_ID, X_CLIENT_SECRET) if X_CLIENT_SECRET else None
-        fresh = _social_json(requests.post(
-            "https://api.x.com/2/oauth2/token", auth=auth, timeout=30,
-            data=dict(grant_type="refresh_token", refresh_token=tok["refresh_token"],
-                      client_id=X_CLIENT_ID)))
-    elif platform == "instagram":
-        fresh = _social_json(requests.get(
-            "https://graph.instagram.com/refresh_access_token", timeout=30,
-            params=dict(grant_type="ig_refresh_token", access_token=tok["access_token"])))
-    else:
-        fresh = _social_json(requests.post(
-            "https://open.tiktokapis.com/v2/oauth/token/", timeout=30,
-            data=dict(client_key=TT_CLIENT_KEY, client_secret=TT_CLIENT_SECRET,
-                      grant_type="refresh_token", refresh_token=tok["refresh_token"])))
-    return {**tok, **fresh}
-
-
-def _social_valid_token(user_id, platform):
-    """Load the saved token and refresh it first if it is about to expire."""
-    row, tok = _social_load(user_id, platform)
-    if not tok:
-        return None
-    exp = row.get("expires_at")
-    # X ~2h, TikTok ~24h: refresh a couple of minutes early.
-    # Instagram lasts 60 days: refresh when under 7 days remain.
-    margin = 7 * 86400 if platform == "instagram" else 120
-    if exp and exp - int(time.time()) < margin:
-        try:
-            tok = _social_refresh(platform, tok)
-            _social_save(user_id, platform, tok, row.get("account_id"))
-        except (RuntimeError, KeyError, requests.exceptions.RequestException) as e:
-            logging.warning(f"social refresh failed for {user_id}/{platform}: {e}")
-            if exp <= int(time.time()):
-                return None  # already expired and could not refresh
-    return tok["access_token"]
-
-
-def _social_done(platform, ok, message):
-    """What the user sees in their browser after the OAuth round trip."""
-    deeplink = os.getenv("SOCIAL_APP_DEEPLINK")
-    if deeplink:
-        sep = "&" if "?" in deeplink else "?"
-        return redirect(f"{deeplink}{sep}" + urlencode(
-            {"platform": platform, "status": "success" if ok else "error"}))
-    color = "#1a7f37" if ok else "#cf222e"
-    return (f"<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<body style='font-family:sans-serif;text-align:center;padding:48px'>"
-            f"<h2 style='color:{color}'>{message}</h2></body>"), (200 if ok else 400)
-
-
-# ---------------------------------------------------------------- routes
-@app.route('/api/social/connect/<platform>', methods=['GET'])
-@jwt_required()
-@limiter.limit("20 per minute")
+# --------------------------------------------------------------- connect
+@app.route("/connect/<platform>")
 def social_connect(platform):
-    """Flutter calls this (with JWT), then opens `auth_url` in the browser."""
     if platform not in SOCIAL_PLATFORMS:
-        return jsonify({"status": "error", "message": "Unknown platform"}), 404
-    user_id = get_jwt_identity()
-    cb = _social_callback_url(platform)
+        abort(404)
+    session.setdefault("uid", secrets.token_hex(8))
+    state = secrets.token_urlsafe(16)
+    session["state"] = state
 
     if platform == "x":
         verifier = secrets.token_urlsafe(64)
+        session["verifier"] = verifier
         challenge = base64.urlsafe_b64encode(
             hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-        q = dict(response_type="code", client_id=X_CLIENT_ID, redirect_uri=cb,
+        q = dict(response_type="code", client_id=X_CLIENT_ID,
+                 redirect_uri=social_callback_url("x"),
                  scope="tweet.read users.read offline.access",
-                 state=_social_make_state(user_id, "x", verifier),
-                 code_challenge=challenge, code_challenge_method="S256")
-        url = "https://x.com/i/oauth2/authorize?" + urlencode(q)
+                 state=state, code_challenge=challenge, code_challenge_method="S256")
+        return social_go("https://x.com/i/oauth2/authorize?" + urlencode(q))
 
-    elif platform == "instagram":
+    if platform == "instagram":
         q = dict(enable_fb_login=0, force_authentication=1, client_id=IG_APP_ID,
-                 redirect_uri=cb, response_type="code",
-                 scope="instagram_business_basic",
-                 state=_social_make_state(user_id, "instagram"))
-        url = "https://www.instagram.com/oauth/authorize?" + urlencode(q)
+                 redirect_uri=social_callback_url("instagram"), response_type="code",
+                 scope="instagram_business_basic", state=state)
+        return social_go("https://www.instagram.com/oauth/authorize?" + urlencode(q))
 
-    else:  # tiktok (Login Kit for Web, https redirect, no PKCE)
-        q = dict(client_key=TT_CLIENT_KEY, response_type="code",
-                 scope="user.info.basic,user.info.stats,video.list",
-                 redirect_uri=cb, state=_social_make_state(user_id, "tiktok"))
-        url = "https://www.tiktok.com/v2/auth/authorize/?" + urlencode(q)
-
-    return jsonify({"status": "success", "auth_url": url}), 200
+    # TikTok Login Kit for Web (https redirect, no PKCE)
+    q = dict(client_key=TT_CLIENT_KEY, response_type="code",
+             scope="user.info.basic,user.info.stats,video.list",
+             redirect_uri=social_callback_url("tiktok"), state=state)
+    return social_go("https://www.tiktok.com/v2/auth/authorize/?" + urlencode(q))
 
 
-@app.route('/callback/<platform>', methods=['GET'])
-@limiter.limit("30 per minute")
+# -------------------------------------------------------------- callback
+@app.route("/callback/<platform>")
 def social_callback(platform):
-    """Browser lands here from X / Instagram / TikTok (register these URLs)."""
     if platform not in SOCIAL_PLATFORMS:
-        return jsonify({"status": "error", "message": "Unknown platform"}), 404
-
-    st = _social_read_state(request.args.get("state", ""), platform)
-    if not st:
-        return _social_done(platform, False, "This link expired. Please start again from the app.")
-
+        abort(404)
+    # Instagram appends "#_" to the redirect; Flask ignores fragments, so fine.
+    if request.args.get("state") != session.get("state"):
+        abort(400, "State mismatch. Start again from /connect/" + platform)
     code = request.args.get("code")
     if not code:
-        logging.warning(f"social callback {platform}: no code "
-                        f"({request.args.get('error_description') or request.args.get('error')})")
-        return _social_done(platform, False, "Authorization was cancelled or denied.")
+        return jsonify(error=request.args.get("error_description")
+                       or request.args.get("error") or "No code returned"), 400
 
-    try:
-        tok, account_id = _social_exchange(platform, code, st.get("v"))
-        if "access_token" not in tok:
-            raise RuntimeError(f"No access token returned: {tok}")
-        if not _social_save(st["u"], platform, tok, account_id):
-            raise RuntimeError("Could not store token")
-    except (RuntimeError, requests.exceptions.RequestException) as e:
-        logging.error(f"social callback {platform} failed: {e}")
-        return _social_done(platform, False, "Could not complete the connection. Please try again.")
+    if platform == "x":
+        data = dict(grant_type="authorization_code", code=code,
+                    redirect_uri=social_callback_url("x"),
+                    code_verifier=session["verifier"], client_id=X_CLIENT_ID)
+        auth = (X_CLIENT_ID, X_CLIENT_SECRET) if X_CLIENT_SECRET else None
+        tok = social_get_json(requests.post("https://api.x.com/2/oauth2/token",
+                                            data=data, auth=auth, timeout=30))
 
-    return _social_done(platform, True, "Connected! You can return to the app.")
+    elif platform == "instagram":
+        short = social_get_json(requests.post(
+            "https://api.instagram.com/oauth/access_token",
+            data=dict(client_id=IG_APP_ID, client_secret=IG_APP_SECRET,
+                      grant_type="authorization_code",
+                      redirect_uri=social_callback_url("instagram"), code=code),
+            timeout=30))
+        short = short.get("data", [short])[0]  # some versions wrap the result
+        # Swap the 1-hour token for a 60-day token (must be done server-side)
+        tok = social_get_json(requests.get(
+            "https://graph.instagram.com/access_token",
+            params=dict(grant_type="ig_exchange_token", client_secret=IG_APP_SECRET,
+                        access_token=short["access_token"]), timeout=30))
 
+    else:  # tiktok
+        data = dict(client_key=TT_CLIENT_KEY, client_secret=TT_CLIENT_SECRET,
+                    code=code, grant_type="authorization_code",
+                    redirect_uri=social_callback_url("tiktok"))
+        tok = social_get_json(requests.post(
+            "https://open.tiktokapis.com/v2/oauth/token/", data=data, timeout=30))
 
-@app.route('/api/social/status', methods=['GET'])
-@jwt_required()
-def social_status():
-    """Which platforms has this user connected?"""
-    user_id = get_jwt_identity()
-    try:
-        res = requests.get(
-            f"{os.getenv('SUPABASE_URL')}/rest/v1/social_connections",
-            headers=_supabase_headers(),
-            params={"user_id": f"eq.{user_id}", "select": "platform"}, timeout=10)
-        connected = [r["platform"] for r in res.json()] if res.status_code == 200 else []
-        return jsonify({"status": "success",
-                        "connected": {p: p in connected for p in SOCIAL_PLATFORMS}}), 200
-    except requests.exceptions.RequestException as e:
-        logging.error(f"social status error for {user_id}: {e}")
-        return jsonify({"status": "error", "message": "Service unavailable"}), 503
-
-
-@app.route('/api/social/disconnect/<platform>', methods=['DELETE'])
-@jwt_required()
-def social_disconnect(platform):
-    if platform not in SOCIAL_PLATFORMS:
-        return jsonify({"status": "error", "message": "Unknown platform"}), 404
-    try:
-        _social_delete(platform, user_id=get_jwt_identity())
-        return jsonify({"status": "success"}), 200
-    except requests.exceptions.RequestException as e:
-        logging.error(f"social disconnect error: {e}")
-        return jsonify({"status": "error", "message": "Service unavailable"}), 503
+    if "access_token" not in tok:
+        return jsonify(error="No access token returned", response=tok), 400
+    SOCIAL_TOKENS[(session["uid"], platform)] = tok
+    return redirect(f"/stats/{platform}")
 
 
-@app.route('/api/social/stats/<platform>', methods=['GET'])
-@jwt_required()
-@limiter.limit("20 per minute")
+# ----------------------------------------------------------------- stats
+@app.route("/stats/<platform>")
 def social_stats(platform):
     if platform not in SOCIAL_PLATFORMS:
-        return jsonify({"status": "error", "message": "Unknown platform"}), 404
-    user_id = get_jwt_identity()
+        abort(404)
+    tok = SOCIAL_TOKENS.get((session.get("uid"), platform))
+    if not tok:
+        return redirect(f"/connect/{platform}")
+    at = tok["access_token"]
 
-    try:
-        at = _social_valid_token(user_id, platform)
-        if not at:
-            return jsonify({"status": "error", "connected": False,
-                            "message": f"{platform} is not connected"}), 404
+    if platform == "x":
+        h = {"Authorization": f"Bearer {at}"}
+        me = social_get_json(requests.get(
+            "https://api.x.com/2/users/me", headers=h, timeout=30,
+            params={"user.fields": "public_metrics"}))["data"]
+        tweets = social_get_json(requests.get(
+            f"https://api.x.com/2/users/{me['id']}/tweets", headers=h, timeout=30,
+            params={"max_results": max(5, SOCIAL_N_POSTS), "tweet.fields": "public_metrics",
+                    "exclude": "retweets,replies"})).get("data", [])
+        inter = [sum(t["public_metrics"].get(k, 0) for k in
+                     ("like_count", "reply_count", "retweet_count", "quote_count"))
+                 for t in tweets[:SOCIAL_N_POSTS]]
+        followers = me["public_metrics"]["followers_count"]
+        name = me.get("username")
 
-        if platform == "x":
-            h = {"Authorization": f"Bearer {at}"}
-            me = _social_json(requests.get(
-                "https://api.x.com/2/users/me", headers=h, timeout=30,
-                params={"user.fields": "public_metrics"}))["data"]
-            tweets = _social_json(requests.get(
-                f"https://api.x.com/2/users/{me['id']}/tweets", headers=h, timeout=30,
-                params={"max_results": max(5, SOCIAL_N_POSTS),
-                        "tweet.fields": "public_metrics",
-                        "exclude": "retweets,replies"})).get("data", [])
-            inter = [sum(t["public_metrics"].get(k, 0) for k in
-                         ("like_count", "reply_count", "retweet_count", "quote_count"))
-                     for t in tweets[:SOCIAL_N_POSTS]]
-            followers = me["public_metrics"]["followers_count"]
-            name = me.get("username")
+    elif platform == "instagram":
+        base = f"https://graph.instagram.com/{IG_VER}"
+        me = social_get_json(requests.get(f"{base}/me", timeout=30, params=dict(
+            fields="username,followers_count,media_count", access_token=at)))
+        media = social_get_json(requests.get(f"{base}/me/media", timeout=30, params=dict(
+            fields="like_count,comments_count", limit=SOCIAL_N_POSTS,
+            access_token=at))).get("data", [])
+        inter = [m.get("like_count", 0) + m.get("comments_count", 0) for m in media]
+        followers = me["followers_count"]
+        name = me.get("username")
 
-        elif platform == "instagram":
-            base = f"https://graph.instagram.com/{IG_VER}"
-            me = _social_json(requests.get(f"{base}/me", timeout=30, params=dict(
-                fields="username,followers_count,media_count", access_token=at)))
-            media = _social_json(requests.get(f"{base}/me/media", timeout=30, params=dict(
-                fields="like_count,comments_count", limit=SOCIAL_N_POSTS,
-                access_token=at))).get("data", [])
-            inter = [m.get("like_count", 0) + m.get("comments_count", 0) for m in media]
-            followers = me["followers_count"]
-            name = me.get("username")
+    else:  # tiktok
+        h = {"Authorization": f"Bearer {at}"}
+        me = social_get_json(requests.get(
+            "https://open.tiktokapis.com/v2/user/info/", headers=h, timeout=30,
+            params={"fields": "display_name,follower_count,likes_count,video_count"}
+        ))["data"]["user"]
+        vids = social_get_json(requests.post(
+            "https://open.tiktokapis.com/v2/video/list/", headers=h, timeout=30,
+            params={"fields": "id,like_count,comment_count,share_count,view_count"},
+            json={"max_count": min(SOCIAL_N_POSTS, 20)}))["data"].get("videos", [])
+        inter = [v.get("like_count", 0) + v.get("comment_count", 0)
+                 + v.get("share_count", 0) for v in vids]
+        followers = me["follower_count"]
+        name = me.get("display_name")
 
-        else:  # tiktok
-            h = {"Authorization": f"Bearer {at}"}
-            me = _social_json(requests.get(
-                "https://open.tiktokapis.com/v2/user/info/", headers=h, timeout=30,
-                params={"fields": "display_name,follower_count,likes_count,video_count"}
-            ))["data"]["user"]
-            vids = _social_json(requests.post(
-                "https://open.tiktokapis.com/v2/video/list/", headers=h, timeout=30,
-                params={"fields": "id,like_count,comment_count,share_count,view_count"},
-                json={"max_count": min(SOCIAL_N_POSTS, 20)}))["data"].get("videos", [])
-            inter = [v.get("like_count", 0) + v.get("comment_count", 0)
-                     + v.get("share_count", 0) for v in vids]
-            followers = me["follower_count"]
-            name = me.get("display_name")
-
-        return jsonify({"status": "success", "platform": platform, "account": name,
-                        "followers": followers, "posts_sampled": len(inter),
-                        "avg_engagement_rate_pct": _social_engagement_rate(inter, followers)}), 200
-
-    except RuntimeError as e:
-        logging.error(f"social stats {platform} API error for {user_id}: {e}")
-        return jsonify({"status": "error", "message": f"{platform} rejected the request"}), 502
-    except requests.exceptions.RequestException as e:
-        logging.error(f"social stats {platform} network error for {user_id}: {e}")
-        return jsonify({"status": "error", "message": "Service unavailable"}), 503
-    except Exception as e:
-        logging.error(f"social stats {platform} unexpected error for {user_id}: {e}")
-        return jsonify({"status": "error", "message": "Internal server error"}), 500
+    return jsonify(platform=platform, account=name, followers=followers,
+                   posts_sampled=len(inter),
+                   avg_engagement_rate_pct=social_engagement_rate(inter, followers))
 
 
 # ------------------------------------------- Instagram Meta-required URLs
-def _social_parse_signed_request(sr):
+def social_parse_signed_request(sr):
     try:
         sig, payload = sr.split(".", 1)
         pad = lambda s: base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
@@ -571,37 +412,30 @@ def _social_parse_signed_request(sr):
         return None
 
 
-@app.route('/instagram/deauthorize', methods=['POST'])
-def ig_deauthorize():
-    data = _social_parse_signed_request(request.form.get("signed_request", ""))
+@app.route("/instagram/deauthorize", methods=["POST"])
+def social_ig_deauthorize():
+    data = social_parse_signed_request(request.form.get("signed_request", ""))
     if not data:
-        return jsonify({"status": "error", "message": "Bad signature"}), 400
-    try:
-        _social_delete("instagram", account_id=data.get("user_id"))
-    except requests.exceptions.RequestException as e:
-        logging.error(f"ig deauthorize cleanup failed: {e}")
+        abort(400, "Bad signature")
+    print("Instagram user deauthorized:", data.get("user_id"))
     return "", 200
 
 
-@app.route('/instagram/delete', methods=['POST'])
-def ig_delete():
-    data = _social_parse_signed_request(request.form.get("signed_request", ""))
+@app.route("/instagram/delete", methods=["POST"])
+def social_ig_delete():
+    data = social_parse_signed_request(request.form.get("signed_request", ""))
     if not data:
-        return jsonify({"status": "error", "message": "Bad signature"}), 400
+        abort(400, "Bad signature")
     code = secrets.token_hex(8)
-    try:
-        _social_delete("instagram", account_id=data.get("user_id"))
-    except requests.exceptions.RequestException as e:
-        logging.error(f"ig delete cleanup failed: {e}")
-    base = os.getenv('APP_BASE_URL', '').rstrip('/')
-    return jsonify({"url": f"{base}/instagram/deletion-status?code={code}",
-                    "confirmation_code": code}), 200
+    print("Instagram deletion requested for:", data.get("user_id"), "code:", code)
+    base = os.getenv("APP_BASE_URL", "").rstrip("/")
+    return jsonify(url=f"{base}/instagram/deletion-status?code={code}",
+                   confirmation_code=code)
 
 
-@app.route('/instagram/deletion-status', methods=['GET'])
-def ig_deletion_status():
-    return "Your Instagram data deletion request has been processed.", 200
-
+@app.route("/instagram/deletion-status")
+def social_ig_deletion_status():
+    return "Your Instagram data deletion request has been processed."
 @app.route('/webhook/bridge', methods=['POST'])
 def bridge():
     raw_body = request.get_data()
