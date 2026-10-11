@@ -189,19 +189,22 @@ def _find_user_id_by_customer_id(customer_id):
         return None
 
 # =====================================================================
-# SOCIAL STATS (X / Instagram / TikTok) - your original flow, fitted to routes.py
+# SOCIAL STATS (X / Instagram / TikTok) - fitted to routes.py
 #
-# 1) Add these to the imports at the top of routes.py:
-#       import secrets
-#       from urllib.parse import urlencode
-#       from flask import redirect, session, abort, Response   (extend your flask import)
+# 1) Paste everything below anywhere after `app = Flask(...)` in routes.py.
+#    (It imports what it needs itself, no other edits to your imports.)
 #
-# 2) Paste everything below anywhere after `app` is created.
+# 2) Env vars on Render: see social_env_vars.txt
 #
-# 3) Env vars on Render: see social_env_vars.txt
-#
-# Pages:  https://flutterv2.onrender.com/social   <- list of socials to connect
+# Pages:  https://flutterv2.onrender.com/social              <- connect your socials
+#         https://flutterv2.onrender.com/stats/<x|instagram|tiktok>
+#         add ?json=1 to a stats URL to get raw JSON instead of the page
 # =====================================================================
+import secrets
+from html import escape
+from urllib.parse import urlencode
+from flask import redirect, session, abort, Response
+
 SOCIAL_PLATFORMS = ("x", "instagram", "tiktok")
 SOCIAL_N_POSTS = 20  # how many recent posts to average over
 IG_VER = "v25.0"
@@ -215,6 +218,61 @@ TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET")
 
 SOCIAL_TOKENS = {}  # {(uid, platform): token dict}. In-memory; lost on restart.
 
+SOCIAL_META = {
+    "x": {"name": "X", "badge": "X",
+          "grad": "linear-gradient(135deg,#0f0f0f,#4a4a4a)"},
+    "instagram": {"name": "Instagram", "badge": "IG",
+                  "grad": "linear-gradient(135deg,#feda75,#fa7e1e,#d62976,#962fbf,#4f5bd5)"},
+    "tiktok": {"name": "TikTok", "badge": "TT",
+               "grad": "linear-gradient(135deg,#25f4ee,#161823 50%,#fe2c55)"},
+}
+
+SOCIAL_CSS = """
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+background:radial-gradient(1200px 600px at 10% -10%,#2a1b5e 0%,transparent 60%),
+radial-gradient(900px 500px at 100% 0%,#0b4f6c 0%,transparent 55%),#0b0d17;color:#eef0f7}
+.wrap{max-width:560px;margin:0 auto;padding:40px 18px 60px}
+h1{font-size:28px;margin:0 0 6px;letter-spacing:-.5px}
+.sub{color:#9aa1b9;margin:0 0 28px;font-size:15px}
+.card{display:flex;align-items:center;gap:14px;background:rgba(255,255,255,.06);
+border:1px solid rgba(255,255,255,.10);border-radius:18px;padding:16px;margin-bottom:14px;
+backdrop-filter:blur(10px);transition:transform .15s,border-color .15s}
+.card:hover{transform:translateY(-2px);border-color:rgba(255,255,255,.25)}
+.badge{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;
+justify-content:center;font-weight:800;color:#fff;flex:none;text-shadow:0 1px 4px rgba(0,0,0,.5)}
+.info{flex:1;min-width:0}
+.info h3{margin:0 0 6px;font-size:17px}
+.pill{display:inline-block;font-size:12px;padding:3px 10px;border-radius:99px;
+background:rgba(255,255,255,.10);color:#b7bdd3}
+.pill.ok{background:rgba(52,211,153,.15);color:#34d399}
+.actions{display:flex;flex-direction:column;gap:8px}
+.btn{display:block;text-align:center;text-decoration:none;color:#fff;font-weight:600;
+font-size:14px;padding:10px 16px;border-radius:12px;white-space:nowrap;
+background:linear-gradient(135deg,#7c5cff,#3b82f6)}
+.btn:hover{filter:brightness(1.12)}
+.btn.ghost{background:rgba(255,255,255,.08);font-weight:500}
+details{margin-top:26px;color:#9aa1b9;font-size:13px}
+summary{cursor:pointer}
+code{display:block;background:rgba(255,255,255,.06);padding:8px 10px;border-radius:8px;
+margin:6px 0;color:#cfd4ea;word-break:break-all}
+.hero{text-align:center;margin-bottom:26px}
+.avatar{width:96px;height:96px;border-radius:50%;object-fit:cover;border:3px solid rgba(255,255,255,.2);
+margin-bottom:12px}
+.avatar.ph{display:inline-flex;align-items:center;justify-content:center;font-size:30px;font-weight:800}
+.hero h2{margin:0;font-size:24px}
+.handle{color:#9aa1b9;margin-top:4px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.tile{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);
+border-radius:18px;padding:18px}
+.tile .k{color:#9aa1b9;font-size:13px;margin-bottom:8px}
+.tile .v{font-size:30px;font-weight:800;letter-spacing:-1px}
+.tile .n{color:#7d84a0;font-size:12px;margin-top:6px}
+.tile.big{grid-column:1/-1;background:linear-gradient(135deg,rgba(124,92,255,.25),rgba(59,130,246,.18))}
+.nav{display:flex;gap:10px;margin-top:22px}
+.nav .btn{flex:1}
+"""
+
 
 def social_callback_url(platform):
     return f"{os.getenv('APP_BASE_URL', '').rstrip('/')}/callback/{platform}"
@@ -225,6 +283,17 @@ def social_engagement_rate(interactions, denominator):
     if not interactions or not denominator:
         return None
     return round(sum(interactions) / len(interactions) / denominator * 100, 3)
+
+
+def social_fmt(n):
+    return f"{n:,}" if isinstance(n, int) else "-"
+
+
+def social_page(title, body):
+    return ("<!doctype html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>" + escape(title) + "</title><style>" + SOCIAL_CSS + "</style></head>"
+            "<body><div class='wrap'>" + body + "</div></body></html>")
 
 
 def social_go(url):
@@ -258,12 +327,28 @@ def social_handle_api_error(e):
 # ------------------------------------------------------------ links page
 @app.route("/social")
 def social_home():
-    links = "".join(
-        f'<li><a href="/connect/{p}">Connect {p}</a> | '
-        f'<a href="/stats/{p}">View {p} stats</a></li>' for p in SOCIAL_PLATFORMS)
-    uris = "".join(f"<li><code>{social_callback_url(p)}</code></li>" for p in SOCIAL_PLATFORMS)
-    return (f"<h2>Social stats</h2><ul>{links}</ul>"
-            f"<p>Redirect URIs to register in each developer portal:</p><ul>{uris}</ul>")
+    cards = ""
+    for p in SOCIAL_PLATFORMS:
+        name = SOCIAL_META[p]["name"]
+        badge = SOCIAL_META[p]["badge"]
+        grad = SOCIAL_META[p]["grad"]
+        if (session.get("uid"), p) in SOCIAL_TOKENS:
+            status = "<span class='pill ok'>Connected</span>"
+            actions = (f"<a class='btn' href='/stats/{p}'>View stats</a>"
+                       f"<a class='btn ghost' href='/connect/{p}'>Reconnect</a>")
+        else:
+            status = "<span class='pill'>Not connected</span>"
+            actions = f"<a class='btn' href='/connect/{p}'>Connect</a>"
+        cards += (f"<div class='card'><div class='badge' style='background:{grad}'>{badge}</div>"
+                  f"<div class='info'><h3>{name}</h3>{status}</div>"
+                  f"<div class='actions'>{actions}</div></div>")
+    uris = "".join(f"<code>{social_callback_url(p)}</code>" for p in SOCIAL_PLATFORMS)
+    body = ("<h1>Link your socials</h1>"
+            "<p class='sub'>Connect an account to see followers, following and engagement.</p>"
+            + cards +
+            "<details><summary>Redirect URIs for the developer portals</summary>" + uris +
+            "</details>")
+    return social_page("Link your socials", body)
 
 
 # --------------------------------------------------------------- connect
@@ -306,7 +391,7 @@ def social_callback(platform):
         abort(404)
     # Instagram appends "#_" to the redirect; Flask ignores fragments, so fine.
     if request.args.get("state") != session.get("state"):
-        abort(400, "State mismatch. Start again from /connect/" + platform)
+        abort(400, "State mismatch. Start again from /social")
     code = request.args.get("code")
     if not code:
         return jsonify(error=request.args.get("error_description")
@@ -361,7 +446,7 @@ def social_stats(platform):
         h = {"Authorization": f"Bearer {at}"}
         me = social_get_json(requests.get(
             "https://api.x.com/2/users/me", headers=h, timeout=30,
-            params={"user.fields": "public_metrics"}))["data"]
+            params={"user.fields": "public_metrics,profile_image_url,name"}))["data"]
         tweets = social_get_json(requests.get(
             f"https://api.x.com/2/users/{me['id']}/tweets", headers=h, timeout=30,
             params={"max_results": max(5, SOCIAL_N_POSTS), "tweet.fields": "public_metrics",
@@ -369,25 +454,36 @@ def social_stats(platform):
         inter = [sum(t["public_metrics"].get(k, 0) for k in
                      ("like_count", "reply_count", "retweet_count", "quote_count"))
                  for t in tweets[:SOCIAL_N_POSTS]]
-        followers = me["public_metrics"]["followers_count"]
-        name = me.get("username")
+        pm = me["public_metrics"]
+        followers = pm.get("followers_count")
+        following = pm.get("following_count")
+        total_posts = pm.get("tweet_count")
+        handle = me.get("username")
+        display = me.get("name") or handle
+        avatar = me.get("profile_image_url")
 
     elif platform == "instagram":
         base = f"https://graph.instagram.com/{IG_VER}"
         me = social_get_json(requests.get(f"{base}/me", timeout=30, params=dict(
-            fields="username,followers_count,media_count", access_token=at)))
+            fields="username,name,profile_picture_url,followers_count,follows_count,media_count",
+            access_token=at)))
         media = social_get_json(requests.get(f"{base}/me/media", timeout=30, params=dict(
             fields="like_count,comments_count", limit=SOCIAL_N_POSTS,
             access_token=at))).get("data", [])
         inter = [m.get("like_count", 0) + m.get("comments_count", 0) for m in media]
-        followers = me["followers_count"]
-        name = me.get("username")
+        followers = me.get("followers_count")
+        following = me.get("follows_count")
+        total_posts = me.get("media_count")
+        handle = me.get("username")
+        display = me.get("name") or handle
+        avatar = me.get("profile_picture_url")
 
     else:  # tiktok
         h = {"Authorization": f"Bearer {at}"}
         me = social_get_json(requests.get(
             "https://open.tiktokapis.com/v2/user/info/", headers=h, timeout=30,
-            params={"fields": "display_name,follower_count,likes_count,video_count"}
+            params={"fields": "display_name,avatar_url,follower_count,following_count,"
+                              "likes_count,video_count"}
         ))["data"]["user"]
         vids = social_get_json(requests.post(
             "https://open.tiktokapis.com/v2/video/list/", headers=h, timeout=30,
@@ -395,12 +491,44 @@ def social_stats(platform):
             json={"max_count": min(SOCIAL_N_POSTS, 20)}))["data"].get("videos", [])
         inter = [v.get("like_count", 0) + v.get("comment_count", 0)
                  + v.get("share_count", 0) for v in vids]
-        followers = me["follower_count"]
-        name = me.get("display_name")
+        followers = me.get("follower_count")
+        following = me.get("following_count")
+        total_posts = me.get("video_count")
+        handle = me.get("display_name")
+        display = handle
+        avatar = me.get("avatar_url")
 
-    return jsonify(platform=platform, account=name, followers=followers,
-                   posts_sampled=len(inter),
-                   avg_engagement_rate_pct=social_engagement_rate(inter, followers))
+    rate = social_engagement_rate(inter, followers)
+
+    if request.args.get("json"):
+        return jsonify(platform=platform, account=handle, followers=followers,
+                       following=following, total_posts=total_posts,
+                       posts_sampled=len(inter), avg_engagement_rate_pct=rate)
+
+    meta = SOCIAL_META[platform]
+    if avatar:
+        pic = f"<img class='avatar' src='{escape(avatar)}' referrerpolicy='no-referrer' alt=''>"
+    else:
+        pic = (f"<div class='avatar ph' style='background:{meta['grad']}'>"
+               f"{escape((display or '?')[:1].upper())}</div>")
+    at_sign = "@" if platform != "tiktok" else ""
+    rate_text = f"{rate}%" if rate is not None else "-"
+    posts_label = "Videos" if platform == "tiktok" else "Posts"
+    body = (
+        "<div class='hero'>" + pic +
+        f"<h2>{escape(display or '')}</h2>"
+        f"<div class='handle'>{at_sign}{escape(handle or '')} &middot; {meta['name']}</div></div>"
+        "<div class='grid'>"
+        f"<div class='tile'><div class='k'>Followers</div><div class='v'>{social_fmt(followers)}</div></div>"
+        f"<div class='tile'><div class='k'>Following</div><div class='v'>{social_fmt(following)}</div></div>"
+        f"<div class='tile big'><div class='k'>Avg engagement rate</div><div class='v'>{rate_text}</div>"
+        f"<div class='n'>Based on your last {len(inter)} {posts_label.lower()}</div></div>"
+        f"<div class='tile'><div class='k'>Total {posts_label.lower()}</div><div class='v'>{social_fmt(total_posts)}</div></div>"
+        f"<div class='tile'><div class='k'>{posts_label} sampled</div><div class='v'>{len(inter)}</div></div>"
+        "</div>"
+        "<div class='nav'><a class='btn ghost' href='/social'>&larr; All socials</a>"
+        f"<a class='btn' href='/stats/{platform}'>Refresh</a></div>")
+    return social_page(f"{meta['name']} stats", body)
 
 
 # ------------------------------------------- Instagram Meta-required URLs
@@ -440,6 +568,7 @@ def social_ig_delete():
 @app.route("/instagram/deletion-status")
 def social_ig_deletion_status():
     return "Your Instagram data deletion request has been processed."
+    
 @app.route('/webhook/bridge', methods=['POST'])
 def bridge():
     raw_body = request.get_data()
