@@ -96,6 +96,48 @@ def _supabase_headers():
         "Content-Type": "application/json",
     }
 
+
+# ── Shared HTTP session for the chat hot path ───────────────────────────────
+# Bare requests.get/post() opens a brand-new TCP+TLS connection on every call.
+# A pooled Session keeps connections alive and reuses them. Retries are limited
+# to *connection setup* failures, so a send can never be duplicated.
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_sb = requests.Session()
+_sb.mount("https://", HTTPAdapter(
+    pool_connections=10,
+    pool_maxsize=50,
+    max_retries=Retry(connect=2, read=0, status=0, redirect=0, backoff_factor=0.2),
+))
+_SB_TIMEOUT = 8  # seconds, so a slow Supabase call can't hang a request forever
+
+# Sender profile pics are looked up on every message; cache them for 10 min.
+_pic_cache = {}  # user_id -> (profile_pic_url, expires_at)
+_PIC_TTL = 600
+
+
+def _get_profile_pic(user_id):
+    uid = str(user_id)
+    hit = _pic_cache.get(uid)
+    if hit and hit[1] > time.time():
+        return hit[0]
+    try:
+        res = _sb.get(
+            f"{os.getenv('SUPABASE_URL')}/rest/v1/users",
+            headers=_supabase_headers(),
+            params={"id": f"eq.{uid}", "select": "profile_pic_url"},
+            timeout=_SB_TIMEOUT,
+        )
+        if res.status_code == 200:
+            rows = res.json()
+            pic = rows[0].get('profile_pic_url') if rows else None
+            _pic_cache[uid] = (pic, time.time() + _PIC_TTL)
+            return pic
+    except Exception as e:
+        logging.warning(f"Could not fetch profile pic for {uid}: {e}")
+    return None
+
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
 BRIDGE_KEY = os.getenv("BRIDGE_KEY")
 
@@ -159,6 +201,8 @@ def handle_connect():
     if user_id:
         active_users[user_id] = request.sid
         print(f"User {user_id} connected! Active users: {len(active_users)}")
+        # Warm the profile-pic cache so their first message doesn't pay for it.
+        socketio.start_background_task(_get_profile_pic, user_id)
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -1278,99 +1322,112 @@ def accept_payment_bubble():
 def handle_profile_pic_updated(data):
     user_id = str(data.get('user_id'))
     url = data.get('profile_pic_url')
+    _pic_cache.pop(user_id, None)
     socketio.emit('profile_pic_updated', {
         'user_id': user_id,
         'profile_pic_url': url
     }, broadcast=True)
         
+def _persist_read(message_id):
+    """DB side of a read receipt. Runs in the background."""
+    try:
+        headers = _supabase_headers()
+        headers["Prefer"] = "return=minimal"
+        _sb.patch(
+            f"{os.getenv('SUPABASE_URL')}/rest/v1/messages",
+            headers=headers,
+            params={"id": f"eq.{message_id}"},
+            json={"is_read": True},
+            timeout=_SB_TIMEOUT,
+        )
+    except Exception as e:
+        logging.error(f"Error persisting read receipt: {e}")
+
+
 @socketio.on('mark_as_read')
 def handle_mark_as_read(data):
     """
-    Triggers when a receiver sees a message. 
-    Updates DB and tells the sender to turn their checkmark blue.
+    Receiver saw a message. Tell the sender FIRST (so the tick flips
+    instantly), then save to the DB in the background.
     """
     message_id = data.get('message_id')
-    sender_id = data.get('sender_id')  # The person who originally sent the message
+    sender_id = data.get('sender_id')  # the person who originally sent it
 
     if not message_id or not sender_id:
         return
 
     try:
-        # 1. Update Supabase so the change is permanent
-        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/messages"
-        headers = {
-            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal"
-        }
-        params = {"id": f"eq.{message_id}"}
-        payload = {"is_read": True}
-        
-        # Sync update to database
-        requests.patch(url, headers=headers, params=params, json=payload)
-
-        # 2. Real-time "Tap on the shoulder" for the Sender
-        # If the sender is currently online, tell their app to update the UI instantly
-        print(f"DEBUG mark_as_read: sender_id={sender_id}, active_users={list(active_users.keys())}")
-        if str(sender_id) in active_users:
-            sender_sid = active_users[str(sender_id)]
-            print(f"DEBUG emitting message_read_update to sid={sender_sid}")
+        sender_sid = active_users.get(str(sender_id))
+        if sender_sid:
             socketio.emit('message_read_update', {
                 'message_id': message_id
             }, room=sender_sid)
-        else:
-            print(f"DEBUG sender_id {sender_id} NOT in active_users — relay skipped")
-            
     except Exception as e:
         logging.error(f"Error in mark_as_read relay: {e}")
+
+    socketio.start_background_task(_persist_read, message_id)
+
+
+_typing_last_persist = {}  # (sender_id, receiver_id) -> time of last upsert
+
+
+def _persist_typing(sender_id, receiver_id, is_typing, typing_text):
+    """DB side of the typing indicator. Runs in the background."""
+    try:
+        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/typing_status"
+        headers = _supabase_headers()
+        if is_typing:
+            headers["Prefer"] = "resolution=merge-duplicates"
+            _sb.post(url, headers=headers, json={
+                "sender_id": sender_id,
+                "receiver_id": receiver_id,
+                "is_typing": True,
+                "typing_text": str(typing_text),
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }, timeout=_SB_TIMEOUT)
+        else:
+            _sb.delete(url, headers=headers, params={
+                "sender_id": f"eq.{sender_id}",
+                "receiver_id": f"eq.{receiver_id}"
+            }, timeout=_SB_TIMEOUT)
+    except Exception as e:
+        logging.error(f"Error persisting typing status: {e}")
+
 
 @socketio.on('typing')
 def handle_typing(data):
     """
-    Handles typing status via WebSockets.
-    This replaces the /api/set_typing HTTP route and stops the logs.
+    Typing status over WebSockets. Relay to the receiver FIRST; the DB write
+    (only used so a freshly opened chat can show "typing...") happens in the
+    background and is throttled, instead of one blocking Supabase call per
+    keystroke.
     """
     sender_id = str(data.get('sender_id'))
     receiver_id = str(data.get('receiver_id'))
     is_typing = data.get('is_typing', False)
     typing_text = data.get('typing_text', "")
 
-    # 1. Update the database (Supabase) via HTTPS Bypass
-    try:
-        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/typing_status"
-        headers = {
-            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}",
-            "Content-Type": "application/json"
-        }
+    # 1. Real-time relay
+    if receiver_id in active_users:
+        socketio.emit('typing', {
+            'sender_id': sender_id,
+            'is_typing': is_typing,
+            'typing_text': typing_text
+        }, room=active_users[receiver_id])
 
-        if is_typing:
-            # UPSERT: Insert or update if exists
-            headers["Prefer"] = "resolution=merge-duplicates"
-            payload = {
-                "sender_id": sender_id,
-                "receiver_id": receiver_id,
-                "is_typing": True,
-                "typing_text": str(typing_text),
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }
-            requests.post(url, headers=headers, json=payload)
-        else:
-            # DELETE: Remove the typing indicator
-            params = {"sender_id": f"eq.{sender_id}", "receiver_id": f"eq.{receiver_id}"}
-            requests.delete(url, headers=headers, params=params)
+    # 2. Persist in the background (upserts at most every 2s per pair)
+    pair = (sender_id, receiver_id)
+    now = time.time()
+    if is_typing:
+        if now - _typing_last_persist.get(pair, 0) < 2:
+            return
+        _typing_last_persist[pair] = now
+    else:
+        _typing_last_persist.pop(pair, None)
+    socketio.start_background_task(
+        _persist_typing, sender_id, receiver_id, is_typing, typing_text
+    )
 
-        # 2. Real-time Relay: Tell the receiver instantly
-        if receiver_id in active_users:
-            socketio.emit('typing', {
-                'sender_id': sender_id,
-                'is_typing': is_typing,
-                'typing_text': typing_text
-            }, room=active_users[receiver_id])
-
-    except Exception as e:
-        logging.error(f"Error in socket typing relay: {e}")
 
 @app.route('/api/posts/<string:post_id>/like', methods=['POST'])
 @jwt_required()
@@ -3361,7 +3418,7 @@ def get_private_messages(user_id, other_id):
             "p_mark_read": mark_read
         }
 
-        response = requests.post(url, headers=headers, json=payload)
+        response = _sb.post(url, headers=headers, json=payload, timeout=_SB_TIMEOUT)
 
         if response.status_code != 200:
             logging.error(f"Supabase RPC error: {response.text}")
@@ -3403,9 +3460,10 @@ def get_private_messages(user_id, other_id):
                 "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
                 "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
             }
-            pay_res = requests.get(
+            pay_res = _sb.get(
                 f"{os.getenv('SUPABASE_URL')}/rest/v1/payments",
                 headers=pay_headers,
+                timeout=_SB_TIMEOUT,
                 params={
                     "or": f"(and(payer_id.eq.{user_id},recipient_id.eq.{other_id}),and(payer_id.eq.{other_id},recipient_id.eq.{user_id}))",
                     "select": "id,reference,payer_id,recipient_id,amount,status,concluded,is_accepted,created_at",
@@ -3489,7 +3547,8 @@ def api_send_message():
     sender_id = data.get("sender_id")
     receiver_id = data.get("receiver_id")
     message_content = str(data.get("message") or data.get("message_content", "")).strip()
-    reply_to_msg_id = data.get("reply_to_msg_id")
+    # Accept the old key too, so older app builds keep working.
+    reply_to_msg_id = data.get("reply_to_msg_id") or data.get("replied_to_id")
     media_content = data.get("media_content") or data.get("media_url")
 
     if str(sender_id) != str(get_jwt_identity()):
@@ -3525,7 +3584,7 @@ def api_send_message():
             "p_media_content": media_content,
             "p_reply_to_msg_id": reply_to_msg_id
         }
-        response = requests.post(url, headers=headers, json=payload)
+        response = _sb.post(url, headers=headers, json=payload, timeout=_SB_TIMEOUT)
 
         if response.status_code != 200:
             logging.error(f"Supabase Send RPC error: {response.text}")
@@ -3537,21 +3596,8 @@ def api_send_message():
         target_token = db_data.get('fcm_token')
         message_id = db_data.get('message_id')  # <-- now comes straight from the RPC, no extra query
 
-        # ---- Fetch sender profile pic (used in socket + push) ----
-        sender_pic_url = None
-        try:
-            pic_res = requests.get(
-                f"{os.getenv('SUPABASE_URL')}/rest/v1/users",
-                headers={
-                    "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-                    "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
-                },
-                params={"id": f"eq.{sender_id}", "select": "profile_pic_url"}
-            )
-            if pic_res.status_code == 200 and pic_res.json():
-                sender_pic_url = pic_res.json()[0].get('profile_pic_url')
-        except Exception as pic_err:
-            logging.warning(f"Could not fetch sender pic: {pic_err}")
+        # ---- Sender profile pic (cached; warmed when the socket connects) ----
+        sender_pic_url = _get_profile_pic(sender_id)
 
         # ---- WebSocket delivery ----
         receiver_id_str = str(receiver_id)
