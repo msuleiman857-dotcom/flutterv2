@@ -663,6 +663,11 @@ def release_funds():
                         }
                     }
                 }
+                
+                try:
+                    logging.error("OUTBOUND IP: " + requests.get("https://api.ipify.org", timeout=10).text)
+                except Exception as e:
+                    logging.error(f"ip check failed: {e}")
 
                 try:
                     kora_res = requests.post(
