@@ -645,7 +645,7 @@ def release_funds():
                     continue
 
                 # ── STEP 3d: Disburse ────────────────────────────────────────
-                payout_amount = round(db_amount * 0.8, 2)
+                payout_amount = round(db_amount, 2)
                 kora_payload = {
                     "reference": release_reference,
                     "destination": {
