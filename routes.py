@@ -4660,3 +4660,704 @@ def list_alerts():
     except Exception as e:
         logging.error(f"list_alerts error: {e}")
         return jsonify({"success": False, "status": "error", "message": "Server error"}), 500
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SAFELENS CIRCLE + RECEIVED ALERTS + RECORDINGS
+#
+#  Paste at the BOTTOM of routes.py, BELOW routes_alert_endpoints.py
+#  (it reuses _alert_sb, _alert_valid_uuid and _alert_contact_ids from there).
+#
+#  No new imports. Needs:
+#    - tables: mutual_contacts, alerts, alert_deliveries, alert_media
+#    - Render env var  R2_RECORDINGS_BUCKET  = name of a PRIVATE R2 bucket
+#      (no public URL / custom domain on it). Your existing R2 keys must be
+#      allowed to read/write that bucket.
+#
+#  Routes:
+#    GET  /api/circle/search?q=            find users by username
+#    POST /api/circle/request              send a request (or auto-accept)
+#    GET  /api/circle                      my circle + incoming + outgoing
+#    POST /api/circle/respond              accept / decline a request
+#    POST /api/circle/remove               remove a contact / cancel a request
+#    GET  /api/alerts/received             alerts sent TO me, clustered
+#    POST /api/alerts/seen                 mark alerts as seen
+#    POST /api/alerts/<id>/media/upload-url   get a private upload link
+#    POST /api/alerts/<id>/media/complete     confirm the upload finished
+#    GET  /api/alerts/<id>/media           get short-lived watch links
+#    POST /api/alerts/<id>/media/delete    sender deletes the recording
+#
+#  Old /api/search_user returns everyone's email - once the app uses
+#  /api/circle/search you can delete it.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_CIRCLE_MAX_PENDING = 30
+_RECORDING_MAX_BYTES = 150 * 1024 * 1024
+_RECORDING_TYPES = {'video/mp4': 'mp4', 'video/quicktime': 'mov'}
+
+
+def _circle_bad(msg, code=400, **extra):
+    body = {"success": False, "status": "error", "message": msg}
+    body.update(extra)
+    return jsonify(body), code
+
+
+def _circle_ok(**data):
+    body = {"success": True, "status": "success"}
+    body.update(data)
+    return jsonify(body), 200
+
+
+def _circle_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _alert_parse_ts(s):
+    """Parse a Supabase timestamp, whatever fractional-second length it has."""
+    s = str(s).replace('Z', '+00:00')
+    if '.' in s:
+        head, tail = s.split('.', 1)
+        digits = ''
+        for ch in tail:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        s = f"{head}.{digits[:6].ljust(6, '0')}{tail[len(digits):]}"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _circle_pair_row(a, b):
+    res = requests.get(
+        _alert_sb('mutual_contacts'),
+        headers=_supabase_headers(),
+        params={
+            'or': f'(and(sender.eq.{a},accepter.eq.{b}),and(sender.eq.{b},accepter.eq.{a}))',
+            'select': 'id,sender,accepter,status',
+            'limit': '1',
+        },
+        timeout=_SB_TIMEOUT,
+    )
+    if res.status_code != 200:
+        raise RuntimeError(f"pair lookup failed: {res.text}")
+    rows = res.json()
+    return rows[0] if rows else None
+
+
+def _circle_link_by_id(link_id):
+    res = requests.get(
+        _alert_sb('mutual_contacts'),
+        headers=_supabase_headers(),
+        params={'id': f'eq.{link_id}', 'select': 'id,sender,accepter,status', 'limit': '1'},
+        timeout=_SB_TIMEOUT,
+    )
+    if res.status_code != 200:
+        raise RuntimeError(f"link lookup failed: {res.text}")
+    rows = res.json()
+    return rows[0] if rows else None
+
+
+def _circle_usernames(ids):
+    ids = [i for i in set(ids) if _alert_valid_uuid(i)]
+    if not ids:
+        return {}
+    quoted = ','.join(f'"{i}"' for i in ids)
+    res = requests.get(
+        _alert_sb('users'),
+        headers=_supabase_headers(),
+        params={'id': f'in.({quoted})', 'select': 'id,username'},
+        timeout=_SB_TIMEOUT,
+    )
+    if res.status_code != 200:
+        return {}
+    return {r['id']: (r.get('username') or 'Someone') for r in res.json()}
+
+
+def _circle_push(user_id, title, body, data):
+    """Fire-and-forget push to one user. Never raises."""
+    def run():
+        try:
+            u = requests.get(
+                _alert_sb('users'),
+                headers=_supabase_headers(),
+                params={'id': f'eq.{user_id}', 'select': 'fcm_token'},
+                timeout=_SB_TIMEOUT,
+            )
+            rows = u.json() if u.status_code == 200 else []
+            token = rows[0].get('fcm_token') if rows else None
+            if not token:
+                return
+            messaging.send(messaging.Message(
+                notification=messaging.Notification(title=title, body=body),
+                android=messaging.AndroidConfig(priority='high'),
+                data={k: str(v) for k, v in data.items()},
+                token=token,
+            ))
+        except Exception as e:
+            logging.error(f"circle push failed: {e}")
+    socketio.start_background_task(run)
+
+
+# ───────────────────────────── CIRCLE ─────────────────────────────
+
+@app.route('/api/circle/search', methods=['GET'])
+@limiter.limit("40 per minute")
+@jwt_required()
+def circle_search():
+    me = get_jwt_identity()
+    raw = (request.args.get('q') or '').strip()
+    q = ''.join(ch for ch in raw if ch.isalnum() or ch in '._-')[:30]
+    if len(q) < 3:
+        return _circle_bad("Type at least 3 characters.")
+    try:
+        res = requests.get(
+            _alert_sb('users'),
+            headers=_supabase_headers(),
+            params={'username': f'ilike.{q}*', 'id': f'neq.{me}',
+                    'select': 'id,username', 'order': 'username.asc', 'limit': '10'},
+            timeout=_SB_TIMEOUT,
+        )
+        if res.status_code != 200:
+            return _circle_bad("Search failed.", 500)
+        users = res.json()
+        if not users:
+            return _circle_ok(results=[])
+
+        rel = requests.get(
+            _alert_sb('mutual_contacts'),
+            headers=_supabase_headers(),
+            params={'or': f'(sender.eq.{me},accepter.eq.{me})',
+                    'select': 'id,sender,accepter,status'},
+            timeout=_SB_TIMEOUT,
+        )
+        by_other = {}
+        if rel.status_code == 200:
+            for r in rel.json():
+                by_other[r['accepter'] if r['sender'] == me else r['sender']] = r
+
+        out = []
+        for u in users:
+            r = by_other.get(u['id'])
+            if not r:
+                relation = 'none'
+            elif r['status']:
+                relation = 'accepted'
+            elif r['sender'] == me:
+                relation = 'pending_sent'
+            else:
+                relation = 'pending_received'
+            out.append({'user_id': u['id'], 'username': u['username'],
+                        'relation': relation, 'link_id': r['id'] if r else None})
+        return _circle_ok(results=out)
+    except Exception as e:
+        logging.error(f"circle_search error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+@app.route('/api/circle/request', methods=['POST'])
+@limiter.limit("20 per hour")
+@jwt_required()
+def circle_request():
+    me = get_jwt_identity()
+    target = str((request.get_json(silent=True) or {}).get('user_id', '')).lower()
+    if not _alert_valid_uuid(target):
+        return _circle_bad("Invalid user.")
+    if target == me:
+        return _circle_bad("You can't add yourself.")
+    try:
+        t = requests.get(
+            _alert_sb('users'), headers=_supabase_headers(),
+            params={'id': f'eq.{target}', 'select': 'id', 'limit': '1'},
+            timeout=_SB_TIMEOUT,
+        )
+        if t.status_code != 200 or not t.json():
+            return _circle_bad("User not found.", 404)
+
+        my_name = _circle_usernames([me]).get(me, 'Someone')
+        existing = _circle_pair_row(me, target)
+        if existing:
+            if existing['status']:
+                return _circle_ok(relation='accepted', link_id=existing['id'],
+                                  message="Already in your circle.")
+            if existing['sender'] == me:
+                return _circle_ok(relation='pending_sent', link_id=existing['id'],
+                                  message="Request already sent.")
+            # They already asked you, so both want it: accept.
+            requests.patch(
+                _alert_sb('mutual_contacts'), headers=_supabase_headers(),
+                params={'id': f"eq.{existing['id']}", 'status': 'eq.false'},
+                json={'status': True, 'responded_at': _circle_now()},
+                timeout=_SB_TIMEOUT,
+            )
+            _circle_push(target, f"{my_name} accepted your request",
+                         "You can now see each other's safety alerts.",
+                         {'type': 'circle_accepted', 'user_id': me})
+            return _circle_ok(relation='accepted', link_id=existing['id'])
+
+        cnt = requests.get(
+            _alert_sb('mutual_contacts'),
+            headers={**_supabase_headers(), 'Prefer': 'count=exact'},
+            params={'sender': f'eq.{me}', 'status': 'eq.false', 'select': 'id', 'limit': '1'},
+            timeout=_SB_TIMEOUT,
+        )
+        try:
+            pending = int(cnt.headers.get('Content-Range', '0/0').split('/')[-1])
+        except ValueError:
+            pending = 0
+        if pending >= _CIRCLE_MAX_PENDING:
+            return _circle_bad("You have too many pending requests. Wait for some to be answered.", 429)
+
+        ins = requests.post(
+            _alert_sb('mutual_contacts'),
+            headers={**_supabase_headers(), 'Prefer': 'return=representation'},
+            json={'sender': me, 'accepter': target, 'status': False},
+            timeout=_SB_TIMEOUT,
+        )
+        if ins.status_code == 409:  # both sides added each other at the same moment
+            again = _circle_pair_row(me, target)
+            if again:
+                return _circle_ok(relation='pending_sent', link_id=again['id'])
+        if ins.status_code not in (200, 201):
+            logging.error(f"circle insert failed: {ins.text}")
+            return _circle_bad("Could not send request.", 500)
+
+        row = ins.json()[0]
+        _circle_push(target, f"{my_name} wants to add you",
+                     "Accept to see each other's safety alerts.",
+                     {'type': 'circle_request', 'user_id': me, 'link_id': row['id']})
+        return _circle_ok(relation='pending_sent', link_id=row['id'])
+    except Exception as e:
+        logging.error(f"circle_request error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+@app.route('/api/circle', methods=['GET'])
+@jwt_required()
+def circle_list():
+    me = get_jwt_identity()
+    try:
+        res = requests.get(
+            _alert_sb('mutual_contacts'),
+            headers=_supabase_headers(),
+            params={'or': f'(sender.eq.{me},accepter.eq.{me})',
+                    'select': 'id,sender,accepter,status,created_at,responded_at',
+                    'order': 'created_at.desc'},
+            timeout=_SB_TIMEOUT,
+        )
+        if res.status_code != 200:
+            return _circle_bad("Could not load your circle.", 500)
+        rows = res.json()
+        others = [r['accepter'] if r['sender'] == me else r['sender'] for r in rows]
+        names = _circle_usernames(others)
+
+        circle, incoming, outgoing = [], [], []
+        for r in rows:
+            other = r['accepter'] if r['sender'] == me else r['sender']
+            item = {'link_id': r['id'], 'user_id': other,
+                    'username': names.get(other, 'Someone'),
+                    'since': r.get('responded_at') or r.get('created_at')}
+            if r['status']:
+                circle.append(item)
+            elif r['sender'] == me:
+                outgoing.append(item)
+            else:
+                incoming.append(item)
+        return _circle_ok(circle=circle, incoming=incoming, outgoing=outgoing)
+    except Exception as e:
+        logging.error(f"circle_list error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+@app.route('/api/circle/respond', methods=['POST'])
+@limiter.limit("60 per hour")
+@jwt_required()
+def circle_respond():
+    me = get_jwt_identity()
+    data = request.get_json(silent=True) or {}
+    link_id = str(data.get('link_id', '')).lower()
+    accept = data.get('accept') is True
+    if not _alert_valid_uuid(link_id):
+        return _circle_bad("Invalid request.")
+    try:
+        row = _circle_link_by_id(link_id)
+        if not row:
+            return _circle_bad("Request not found.", 404)
+        if row['accepter'] != me or row['status']:
+            return _circle_bad("Nothing to respond to.", 403)
+
+        if accept:
+            requests.patch(
+                _alert_sb('mutual_contacts'), headers=_supabase_headers(),
+                params={'id': f'eq.{link_id}', 'status': 'eq.false'},
+                json={'status': True, 'responded_at': _circle_now()},
+                timeout=_SB_TIMEOUT,
+            )
+            my_name = _circle_usernames([me]).get(me, 'Someone')
+            _circle_push(row['sender'], f"{my_name} accepted your request",
+                         "You can now see each other's safety alerts.",
+                         {'type': 'circle_accepted', 'user_id': me})
+            return _circle_ok(relation='accepted', link_id=link_id)
+
+        requests.delete(
+            _alert_sb('mutual_contacts'), headers=_supabase_headers(),
+            params={'id': f'eq.{link_id}', 'status': 'eq.false'},
+            timeout=_SB_TIMEOUT,
+        )
+        return _circle_ok(relation='none')
+    except Exception as e:
+        logging.error(f"circle_respond error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+@app.route('/api/circle/remove', methods=['POST'])
+@limiter.limit("60 per hour")
+@jwt_required()
+def circle_remove():
+    me = get_jwt_identity()
+    link_id = str((request.get_json(silent=True) or {}).get('link_id', '')).lower()
+    if not _alert_valid_uuid(link_id):
+        return _circle_bad("Invalid request.")
+    try:
+        row = _circle_link_by_id(link_id)
+        if not row or me not in (row['sender'], row['accepter']):
+            return _circle_bad("Not found.", 404)
+        # Silent on purpose: removing someone sends no notification.
+        requests.delete(
+            _alert_sb('mutual_contacts'), headers=_supabase_headers(),
+            params={'id': f'eq.{link_id}'}, timeout=_SB_TIMEOUT,
+        )
+        return _circle_ok()
+    except Exception as e:
+        logging.error(f"circle_remove error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+# ───────────────────────── RECEIVED ALERTS ─────────────────────────
+
+@app.route('/api/alerts/received', methods=['GET'])
+@jwt_required()
+def alerts_received():
+    me = get_jwt_identity()
+    try:
+        # Removing someone from your circle also removes their old alerts.
+        contacts = set(_alert_contact_ids(me))
+        if not contacts:
+            return _circle_ok(clusters=[], unseen=0)
+
+        res = requests.get(
+            _alert_sb('alert_deliveries'),
+            headers=_supabase_headers(),
+            params={
+                'recipient_id': f'eq.{me}',
+                'select': 'alert_id,seen_at,sent_at,'
+                          'alerts(id,user_id,latitude,longitude,accuracy,recorded_at,'
+                          'triggered_at,trigger_type,alert_media(part,status,duration_ms))',
+                'order': 'sent_at.desc',
+                'limit': '300',
+            },
+            timeout=_SB_TIMEOUT,
+        )
+        if res.status_code != 200:
+            logging.error(f"alerts_received query failed: {res.text}")
+            return _circle_bad("Could not load alerts.", 500)
+
+        items = []
+        for d in res.json():
+            a = d.get('alerts')
+            if not a or a['user_id'] not in contacts:
+                continue
+            all_media = a.get('alert_media') or []
+            ready = sorted([m for m in all_media if m.get('status') == 'ready'],
+                           key=lambda m: m.get('part', 0))
+            if ready:
+                media = {'status': 'ready', 'duration_ms': ready[0].get('duration_ms')}
+            elif any(m.get('status') == 'pending' for m in all_media):
+                media = {'status': 'pending'}
+            else:
+                media = None
+            items.append({
+                'id': a['id'], 'user_id': a['user_id'],
+                'latitude': a.get('latitude'), 'longitude': a.get('longitude'),
+                'accuracy': a.get('accuracy'), 'recorded_at': a.get('recorded_at'),
+                'triggered_at': a['triggered_at'], 'trigger_type': a.get('trigger_type'),
+                'seen': d.get('seen_at') is not None, 'media': media,
+                '_t': _alert_parse_ts(a['triggered_at']),
+            })
+
+        now = datetime.now(timezone.utc)
+        by_user = {}
+        for it in items:
+            by_user.setdefault(it['user_id'], []).append(it)
+        names = _circle_usernames(list(by_user.keys()))
+
+        clusters = []
+        for uid, lst in by_user.items():
+            lst.sort(key=lambda x: x['_t'])  # oldest first
+            groups, cur = [], [lst[0]]
+            for it in lst[1:]:
+                if it['_t'] - cur[-1]['_t'] > timedelta(minutes=30):
+                    groups.append(cur)
+                    cur = [it]
+                else:
+                    cur.append(it)
+            groups.append(cur)
+
+            for g in groups:
+                latest = g[-1]['_t']
+                age = now - latest
+                status = ('active' if age < timedelta(minutes=15)
+                          else 'earlier' if age < timedelta(hours=24) else 'older')
+                escalating = (age < timedelta(minutes=30) and any(
+                    g[i + 2]['_t'] - g[i]['_t'] <= timedelta(minutes=10)
+                    for i in range(len(g) - 2)))
+                clusters.append({
+                    'user_id': uid,
+                    'username': names.get(uid, 'Someone'),
+                    'status': status,
+                    'escalating': escalating,
+                    'count': len(g),
+                    'unseen': sum(1 for x in g if not x['seen']),
+                    'latest_at': g[-1]['triggered_at'],
+                    'alerts': [{k: v for k, v in x.items() if k != '_t'} for x in reversed(g)],
+                    '_sort': latest,
+                })
+
+        clusters.sort(key=lambda c: c['_sort'], reverse=True)
+        for c in clusters:
+            c.pop('_sort')
+        return _circle_ok(clusters=clusters, unseen=sum(c['unseen'] for c in clusters))
+    except Exception as e:
+        logging.error(f"alerts_received error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+@app.route('/api/alerts/seen', methods=['POST'])
+@jwt_required()
+def alerts_mark_seen():
+    me = get_jwt_identity()
+    raw = (request.get_json(silent=True) or {}).get('alert_ids') or []
+    ids = [str(i).lower() for i in raw][:50]
+    ids = [i for i in ids if _alert_valid_uuid(i)]
+    if not ids:
+        return _circle_ok()
+    try:
+        quoted = ','.join(f'"{i}"' for i in ids)
+        requests.patch(
+            _alert_sb('alert_deliveries'), headers=_supabase_headers(),
+            params={'recipient_id': f'eq.{me}', 'alert_id': f'in.({quoted})',
+                    'seen_at': 'is.null'},
+            json={'seen_at': _circle_now()}, timeout=_SB_TIMEOUT,
+        )
+        return _circle_ok()
+    except Exception as e:
+        logging.error(f"alerts_mark_seen error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+# ───────────────────────────── RECORDINGS ─────────────────────────────
+
+def _alert_owner(alert_id):
+    res = requests.get(
+        _alert_sb('alerts'), headers=_supabase_headers(),
+        params={'id': f'eq.{alert_id}', 'select': 'id,user_id', 'limit': '1'},
+        timeout=_SB_TIMEOUT,
+    )
+    rows = res.json() if res.status_code == 200 else []
+    return rows[0]['user_id'] if rows else None
+
+
+def _alert_can_view(alert_id, me):
+    """Owner, or someone who was alerted AND is still an accepted contact."""
+    owner = _alert_owner(alert_id)
+    if not owner:
+        return False
+    if owner == me:
+        return True
+    d = requests.get(
+        _alert_sb('alert_deliveries'), headers=_supabase_headers(),
+        params={'alert_id': f'eq.{alert_id}', 'recipient_id': f'eq.{me}',
+                'select': 'alert_id', 'limit': '1'},
+        timeout=_SB_TIMEOUT,
+    )
+    if d.status_code != 200 or not d.json():
+        return False
+    return owner in _alert_contact_ids(me)
+
+
+def _recording_row(alert_id, part=0):
+    res = requests.get(
+        _alert_sb('alert_media'), headers=_supabase_headers(),
+        params={'alert_id': f'eq.{alert_id}', 'part': f'eq.{part}',
+                'select': 'id,r2_key,status', 'limit': '1'},
+        timeout=_SB_TIMEOUT,
+    )
+    rows = res.json() if res.status_code == 200 else []
+    return rows[0] if rows else None
+
+
+@app.route('/api/alerts/<string:alert_id>/media/upload-url', methods=['POST'])
+@limiter.limit("20 per hour")
+@jwt_required()
+def alert_media_upload_url(alert_id):
+    me = get_jwt_identity()
+    alert_id = alert_id.lower()
+    if not _alert_valid_uuid(alert_id):
+        return _circle_bad("Invalid alert.")
+    data = request.get_json(silent=True) or {}
+    ctype = str(data.get('content_type', 'video/mp4'))
+    try:
+        size = int(data.get('size_bytes') or 0)
+        duration = int(data.get('duration_ms') or 0) or None
+    except (TypeError, ValueError):
+        return _circle_bad("Invalid size.")
+    if ctype not in _RECORDING_TYPES:
+        return _circle_bad("Unsupported video type.")
+    if size <= 0 or size > _RECORDING_MAX_BYTES:
+        return _circle_bad("Video is too large.")
+    bucket = os.getenv('R2_RECORDINGS_BUCKET')
+    if not bucket:
+        logging.error("R2_RECORDINGS_BUCKET is not set")
+        return _circle_bad("Recording upload is not configured.", 500)
+    try:
+        if _alert_owner(alert_id) != me:
+            return _circle_bad("Alert not found.", 404)
+
+        existing = _recording_row(alert_id)
+        if existing and existing['status'] == 'ready':
+            return _circle_bad("Recording already uploaded.", 409)
+
+        if existing:
+            key = existing['r2_key']
+            requests.patch(
+                _alert_sb('alert_media'), headers=_supabase_headers(),
+                params={'id': f"eq.{existing['id']}"},
+                json={'content_type': ctype, 'size_bytes': size, 'duration_ms': duration},
+                timeout=_SB_TIMEOUT,
+            )
+        else:
+            key = f"recordings/{me}/{alert_id}/0-{uuid.uuid4().hex}.{_RECORDING_TYPES[ctype]}"
+            ins = requests.post(
+                _alert_sb('alert_media'), headers=_supabase_headers(),
+                json={'alert_id': alert_id, 'user_id': me, 'part': 0, 'r2_key': key,
+                      'content_type': ctype, 'size_bytes': size,
+                      'duration_ms': duration, 'status': 'pending'},
+                timeout=_SB_TIMEOUT,
+            )
+            if ins.status_code not in (200, 201, 204):
+                logging.error(f"alert_media insert failed: {ins.text}")
+                return _circle_bad("Could not prepare upload.", 500)
+
+        signed = eventlet.tpool.execute(
+            r2.generate_presigned_url, 'put_object',
+            Params={'Bucket': bucket, 'Key': key, 'ContentType': ctype},
+            ExpiresIn=1800,
+        )
+        return _circle_ok(upload_url=signed, content_type=ctype)
+    except Exception as e:
+        logging.error(f"alert_media_upload_url error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+@app.route('/api/alerts/<string:alert_id>/media/complete', methods=['POST'])
+@jwt_required()
+def alert_media_complete(alert_id):
+    me = get_jwt_identity()
+    alert_id = alert_id.lower()
+    if not _alert_valid_uuid(alert_id):
+        return _circle_bad("Invalid alert.")
+    bucket = os.getenv('R2_RECORDINGS_BUCKET')
+    try:
+        if _alert_owner(alert_id) != me:
+            return _circle_bad("Alert not found.", 404)
+        row = _recording_row(alert_id)
+        if not row:
+            return _circle_bad("No upload started for this alert.", 404)
+
+        try:
+            head = eventlet.tpool.execute(r2.head_object, Bucket=bucket, Key=row['r2_key'])
+        except Exception:
+            return _circle_bad("Upload not found. Please try again.")
+        size = int(head.get('ContentLength', 0))
+        if size <= 0 or size > _RECORDING_MAX_BYTES:
+            try:
+                eventlet.tpool.execute(r2.delete_object, Bucket=bucket, Key=row['r2_key'])
+            except Exception:
+                pass
+            return _circle_bad("Uploaded video has an invalid size.")
+
+        requests.patch(
+            _alert_sb('alert_media'), headers=_supabase_headers(),
+            params={'id': f"eq.{row['id']}"},
+            json={'status': 'ready', 'size_bytes': size, 'uploaded_at': _circle_now()},
+            timeout=_SB_TIMEOUT,
+        )
+        return _circle_ok()
+    except Exception as e:
+        logging.error(f"alert_media_complete error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+@app.route('/api/alerts/<string:alert_id>/media', methods=['GET'])
+@jwt_required()
+def alert_media_get(alert_id):
+    me = get_jwt_identity()
+    alert_id = alert_id.lower()
+    if not _alert_valid_uuid(alert_id):
+        return _circle_bad("Invalid alert.")
+    bucket = os.getenv('R2_RECORDINGS_BUCKET')
+    try:
+        if not _alert_can_view(alert_id, me):
+            return _circle_bad("Not found.", 404)  # 404 on purpose: don't reveal what exists
+
+        res = requests.get(
+            _alert_sb('alert_media'), headers=_supabase_headers(),
+            params={'alert_id': f'eq.{alert_id}', 'status': 'eq.ready',
+                    'select': 'part,r2_key,content_type,duration_ms', 'order': 'part.asc'},
+            timeout=_SB_TIMEOUT,
+        )
+        rows = res.json() if res.status_code == 200 else []
+        media = []
+        for r in rows:
+            url = eventlet.tpool.execute(
+                r2.generate_presigned_url, 'get_object',
+                Params={'Bucket': bucket, 'Key': r['r2_key']}, ExpiresIn=3600,
+            )
+            media.append({'part': r['part'], 'content_type': r['content_type'],
+                          'duration_ms': r.get('duration_ms'), 'url': url})
+        return _circle_ok(media=media)
+    except Exception as e:
+        logging.error(f"alert_media_get error: {e}")
+        return _circle_bad("Server error.", 500)
+
+
+@app.route('/api/alerts/<string:alert_id>/media/delete', methods=['POST'])
+@jwt_required()
+def alert_media_delete(alert_id):
+    me = get_jwt_identity()
+    alert_id = alert_id.lower()
+    if not _alert_valid_uuid(alert_id):
+        return _circle_bad("Invalid alert.")
+    bucket = os.getenv('R2_RECORDINGS_BUCKET')
+    try:
+        if _alert_owner(alert_id) != me:
+            return _circle_bad("Alert not found.", 404)
+        res = requests.get(
+            _alert_sb('alert_media'), headers=_supabase_headers(),
+            params={'alert_id': f'eq.{alert_id}', 'select': 'r2_key'},
+            timeout=_SB_TIMEOUT,
+        )
+        for r in (res.json() if res.status_code == 200 else []):
+            try:
+                eventlet.tpool.execute(r2.delete_object, Bucket=bucket, Key=r['r2_key'])
+            except Exception as e:
+                logging.error(f"R2 delete failed for {r['r2_key']}: {e}")
+        requests.delete(
+            _alert_sb('alert_media'), headers=_supabase_headers(),
+            params={'alert_id': f'eq.{alert_id}'}, timeout=_SB_TIMEOUT,
+        )
+        return _circle_ok()
+    except Exception as e:
+        logging.error(f"alert_media_delete error: {e}")
+        return _circle_bad("Server error.", 500)
