@@ -1154,6 +1154,26 @@ def update_location():
 @app.route('/api/user_location/<string:user_id>', methods=['GET'])
 @jwt_required()
 def get_user_location(user_id):
+    me = get_jwt_identity()
+
+    if not re.fullmatch(r'[0-9a-fA-F-]{36}', user_id):
+        return jsonify({"success": False, "message": "Invalid user id"}), 400
+
+    if me != user_id:
+        chk = requests.get(
+            f"{os.getenv('SUPABASE_URL')}/rest/v1/mutual_contacts",
+            headers=_supabase_headers(),
+            params={
+                "status": "eq.true",
+                "select": "id",
+                "or": f"(and(sender.eq.{me},accepter.eq.{user_id}),"
+                      f"and(sender.eq.{user_id},accepter.eq.{me}))",
+                "limit": "1",
+            },
+            timeout=_SB_TIMEOUT,
+        )
+        if chk.status_code != 200 or not chk.json():
+            return jsonify({"success": False, "message": "Not in your circle"}), 403
     try:
         supabase_url = os.getenv('SUPABASE_URL')
         supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
