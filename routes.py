@@ -4371,3 +4371,292 @@ def check_premium_status(user_id):
     except Exception as e:
         logging.error(f"Check premium error: {e}")
         return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
+
+def _alert_sb(path):
+    return f"{os.getenv('SUPABASE_URL')}/rest/v1/{path}"
+
+
+def _alert_valid_uuid(value):
+    """True only for a canonical lowercase uuid string (safe to use in filters)."""
+    try:
+        s = str(value).lower()
+        return str(uuid.UUID(s)) == s
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+def _alert_contact_ids(user_id):
+    """Everyone with an ACCEPTED mutual_contacts row to this user, either direction."""
+    res = requests.get(
+        _alert_sb('mutual_contacts'),
+        headers=_supabase_headers(),
+        params={
+            'status': 'eq.true',
+            'or': f'(sender.eq.{user_id},accepter.eq.{user_id})',
+            'select': 'sender,accepter',
+        },
+        timeout=_SB_TIMEOUT,
+    )
+    if res.status_code != 200:
+        raise RuntimeError(f"contacts lookup failed: {res.text}")
+    ids = set()
+    for row in res.json():
+        ids.add(row['accepter'] if row['sender'] == user_id else row['sender'])
+    return list(ids)
+
+
+def _alert_release_claim(alert_id):
+    try:
+        requests.patch(
+            _alert_sb('alerts'),
+            headers=_supabase_headers(),
+            params={'id': f'eq.{alert_id}'},
+            json={'dispatched_at': None},
+            timeout=_SB_TIMEOUT,
+        )
+    except Exception:
+        pass
+
+
+def _dispatch_alert(alert):
+    """
+    Push an alert to the user's accepted contacts.
+    Safe to call more than once for the same alert: the 'claim' below is atomic,
+    so only the first caller sends (the route now, the webhook later).
+    """
+    try:
+        alert_id = str(alert['id'])
+        user_id = str(alert['user_id'])
+        if not (_alert_valid_uuid(alert_id) and _alert_valid_uuid(user_id)):
+            logging.error(f"alert dispatch skipped, bad ids: {alert_id} / {user_id}")
+            return
+
+        # Claim: set dispatched_at only if it is still null.
+        claim = requests.patch(
+            _alert_sb('alerts'),
+            headers={**_supabase_headers(), 'Prefer': 'return=representation'},
+            params={'id': f'eq.{alert_id}', 'dispatched_at': 'is.null'},
+            json={'dispatched_at': datetime.now(timezone.utc).isoformat()},
+            timeout=_SB_TIMEOUT,
+        )
+        if claim.status_code != 200 or not claim.json():
+            return  # someone else already handled it
+
+        try:
+            contacts = _alert_contact_ids(user_id)
+            if not contacts:
+                return
+
+            sender_name = 'Someone'
+            u = requests.get(
+                _alert_sb('users'),
+                headers=_supabase_headers(),
+                params={'id': f'eq.{user_id}', 'select': 'username'},
+                timeout=_SB_TIMEOUT,
+            )
+            if u.status_code == 200 and u.json():
+                sender_name = u.json()[0].get('username') or sender_name
+
+            quoted = ','.join(f'"{c}"' for c in contacts)
+            t = requests.get(
+                _alert_sb('users'),
+                headers=_supabase_headers(),
+                params={'id': f'in.({quoted})', 'select': 'id,fcm_token'},
+                timeout=_SB_TIMEOUT,
+            )
+            tokens = ({r['id']: r.get('fcm_token') for r in t.json()}
+                      if t.status_code == 200 else {})
+        except Exception as e:
+            logging.error(f"alert {alert_id}: lookup failed, releasing claim: {e}")
+            _alert_release_claim(alert_id)
+            return
+
+        lat, lng = alert.get('latitude'), alert.get('longitude')
+        has_loc = lat is not None and lng is not None
+        body = ("Their last known location was shared with you. Tap to open the map."
+                if has_loc else
+                "They lifted their finger, but no location was available.")
+
+        deliveries = []
+        for cid in contacts:
+            token = tokens.get(cid)
+            if not token:
+                deliveries.append({'alert_id': alert_id, 'recipient_id': cid, 'status': 'no_token'})
+                continue
+
+            status = 'sent'
+            try:
+                messaging.send(messaging.Message(
+                    notification=messaging.Notification(
+                        title=f"🚨 {sender_name} may need help",
+                        body=body,
+                    ),
+                    android=messaging.AndroidConfig(
+                        priority='high',
+                        ttl=3600,  # an hour-old emergency push is worse than none
+                        notification=messaging.AndroidNotification(
+                            channel_id='safety_alerts',
+                            priority='max',
+                        ),
+                    ),
+                    apns=messaging.APNSConfig(
+                        headers={'apns-priority': '10'},
+                        payload=messaging.APNSPayload(aps=messaging.Aps(sound='default')),
+                    ),
+                    data={
+                        'type': 'safety_alert',
+                        'alert_id': alert_id,
+                        'sender_id': user_id,
+                        'sender_name': sender_name,
+                        'latitude': '' if lat is None else str(lat),
+                        'longitude': '' if lng is None else str(lng),
+                        'recorded_at': str(alert.get('recorded_at') or ''),
+                    },
+                    token=token,
+                ))
+            except messaging.UnregisteredError:
+                status = 'failed'
+                try:  # dead token (e.g. an old FlowPay install): clear it
+                    requests.patch(
+                        _alert_sb('users'),
+                        headers=_supabase_headers(),
+                        params={'id': f'eq.{cid}'},
+                        json={'fcm_token': None},
+                        timeout=_SB_TIMEOUT,
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                logging.error(f"alert {alert_id}: push to {cid} failed: {e}")
+                status = 'failed'
+
+            deliveries.append({'alert_id': alert_id, 'recipient_id': cid, 'status': status})
+
+        try:
+            requests.post(
+                _alert_sb('alert_deliveries'),
+                headers={**_supabase_headers(), 'Prefer': 'resolution=ignore-duplicates'},
+                params={'on_conflict': 'alert_id,recipient_id'},
+                json=deliveries,
+                timeout=_SB_TIMEOUT,
+            )
+        except Exception as e:
+            logging.error(f"alert {alert_id}: could not log deliveries: {e}")
+
+    except Exception as e:
+        logging.error(f"alert dispatch crashed: {e}")
+
+
+@app.route('/api/alert', methods=['POST'])
+@limiter.limit("30 per hour")
+@jwt_required()
+def create_alert():
+    user_id = get_jwt_identity()
+    data = request.get_json(silent=True) or {}
+
+    def bad(msg, code=400):
+        return jsonify({"success": False, "status": "error", "message": msg}), code
+
+    # The phone makes this id, so a retry of the same alert can never duplicate.
+    client_alert_id = str(data.get('client_alert_id', '')).lower()
+    if not _alert_valid_uuid(client_alert_id):
+        return bad("Invalid alert id")
+
+    lat, lng = data.get('latitude'), data.get('longitude')
+    if (lat is None) != (lng is None):
+        return bad("Send both coordinates or neither")
+    if lat is not None:
+        try:
+            lat, lng = float(lat), float(lng)
+        except (TypeError, ValueError):
+            return bad("Invalid coordinates")
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return bad("Coordinates out of range")
+
+    trigger = data.get('trigger_type', 'screen')
+    if trigger not in ('screen', 'volume'):
+        return bad("Invalid trigger")
+
+    try:
+        accuracy = float(data['accuracy']) if data.get('accuracy') is not None else None
+    except (TypeError, ValueError):
+        accuracy = None
+
+    recorded_at = None
+    raw_ts = data.get('recorded_at')
+    if raw_ts:
+        try:
+            recorded_at = datetime.fromisoformat(str(raw_ts).replace('Z', '+00:00')).isoformat()
+        except ValueError:
+            recorded_at = None
+
+    row = {
+        'client_alert_id': client_alert_id,
+        'user_id': user_id,
+        'latitude': lat,
+        'longitude': lng,
+        'accuracy': accuracy,
+        'recorded_at': recorded_at,
+        'trigger_type': trigger,
+        'suspected_spoof': bool(data.get('suspected_spoof', False)),
+    }
+
+    try:
+        res = requests.post(
+            _alert_sb('alerts'),
+            headers={**_supabase_headers(),
+                     'Prefer': 'resolution=ignore-duplicates,return=representation'},
+            params={'on_conflict': 'client_alert_id'},
+            json=row,
+            timeout=_SB_TIMEOUT,
+        )
+        if res.status_code not in (200, 201):
+            logging.error(f"alert insert failed: {res.status_code} {res.text}")
+            return bad("Could not save alert", 500)
+
+        rows = res.json()
+        if not rows:  # same alert id arrived again (a retry): load the original
+            ex = requests.get(
+                _alert_sb('alerts'),
+                headers=_supabase_headers(),
+                params={'client_alert_id': f'eq.{client_alert_id}',
+                        'user_id': f'eq.{user_id}', 'select': '*'},
+                timeout=_SB_TIMEOUT,
+            )
+            rows = ex.json() if ex.status_code == 200 else []
+        if not rows:
+            return bad("Could not save alert", 500)
+
+        alert = rows[0]
+        # Answer the phone now; send the pushes in the background.
+        socketio.start_background_task(_dispatch_alert, alert)
+        return jsonify({"success": True, "status": "success", "alert_id": alert['id']}), 200
+
+    except Exception as e:
+        logging.error(f"create_alert error: {e}")
+        return bad("Server error", 500)
+
+
+@app.route('/api/alerts', methods=['GET'])
+@jwt_required()
+def list_alerts():
+    user_id = get_jwt_identity()
+    try:
+        res = requests.get(
+            _alert_sb('alerts'),
+            headers=_supabase_headers(),
+            params={
+                'user_id': f'eq.{user_id}',
+                'select': 'id,latitude,longitude,triggered_at,trigger_type,'
+                          'alert_deliveries(recipient_id,status,seen_at)',
+                'order': 'triggered_at.desc',
+                'limit': '50',
+            },
+            timeout=_SB_TIMEOUT,
+        )
+        if res.status_code != 200:
+            return jsonify({"success": False, "status": "error",
+                            "message": "Could not load alerts"}), 500
+        return jsonify({"success": True, "status": "success", "alerts": res.json()}), 200
+    except Exception as e:
+        logging.error(f"list_alerts error: {e}")
+        return jsonify({"success": False, "status": "error", "message": "Server error"}), 500
