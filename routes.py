@@ -4404,295 +4404,23 @@ def _alert_contact_ids(user_id):
     return list(ids)
 
 
-def _alert_release_claim(alert_id):
-    try:
-        requests.patch(
-            _alert_sb('alerts'),
-            headers=_supabase_headers(),
-            params={'id': f'eq.{alert_id}'},
-            json={'dispatched_at': None},
-            timeout=_SB_TIMEOUT,
-        )
-    except Exception:
-        pass
-
-
-def _dispatch_alert(alert):
-    """
-    Push an alert to the user's accepted contacts.
-    Safe to call more than once for the same alert: the 'claim' below is atomic,
-    so only the first caller sends (the route now, the webhook later).
-    """
-    try:
-        alert_id = str(alert['id'])
-        user_id = str(alert['user_id'])
-        if not (_alert_valid_uuid(alert_id) and _alert_valid_uuid(user_id)):
-            logging.error(f"alert dispatch skipped, bad ids: {alert_id} / {user_id}")
-            return
-
-        # Claim: set dispatched_at only if it is still null.
-        claim = requests.patch(
-            _alert_sb('alerts'),
-            headers={**_supabase_headers(), 'Prefer': 'return=representation'},
-            params={'id': f'eq.{alert_id}', 'dispatched_at': 'is.null'},
-            json={'dispatched_at': datetime.now(timezone.utc).isoformat()},
-            timeout=_SB_TIMEOUT,
-        )
-        if claim.status_code != 200 or not claim.json():
-            return  # someone else already handled it
-
-        try:
-            contacts = _alert_contact_ids(user_id)
-            if not contacts:
-                return
-
-            sender_name = 'Someone'
-            u = requests.get(
-                _alert_sb('users'),
-                headers=_supabase_headers(),
-                params={'id': f'eq.{user_id}', 'select': 'username'},
-                timeout=_SB_TIMEOUT,
-            )
-            if u.status_code == 200 and u.json():
-                sender_name = u.json()[0].get('username') or sender_name
-
-            quoted = ','.join(f'"{c}"' for c in contacts)
-            t = requests.get(
-                _alert_sb('users'),
-                headers=_supabase_headers(),
-                params={'id': f'in.({quoted})', 'select': 'id,fcm_token'},
-                timeout=_SB_TIMEOUT,
-            )
-            tokens = ({r['id']: r.get('fcm_token') for r in t.json()}
-                      if t.status_code == 200 else {})
-        except Exception as e:
-            logging.error(f"alert {alert_id}: lookup failed, releasing claim: {e}")
-            _alert_release_claim(alert_id)
-            return
-
-        lat, lng = alert.get('latitude'), alert.get('longitude')
-        has_loc = lat is not None and lng is not None
-        body = ("Their last known location was shared with you. Tap to open the map."
-                if has_loc else
-                "They lifted their finger, but no location was available.")
-
-        deliveries = []
-        for cid in contacts:
-            token = tokens.get(cid)
-            if not token:
-                deliveries.append({'alert_id': alert_id, 'recipient_id': cid, 'status': 'no_token'})
-                continue
-
-            status = 'sent'
-            try:
-                messaging.send(messaging.Message(
-                    notification=messaging.Notification(
-                        title=f"🚨 {sender_name} may need help",
-                        body=body,
-                    ),
-                    android=messaging.AndroidConfig(
-                        priority='high',
-                        ttl=3600,  # an hour-old emergency push is worse than none
-                        notification=messaging.AndroidNotification(
-                            channel_id='safety_alerts',
-                            priority='max',
-                        ),
-                    ),
-                    apns=messaging.APNSConfig(
-                        headers={'apns-priority': '10'},
-                        payload=messaging.APNSPayload(aps=messaging.Aps(sound='default')),
-                    ),
-                    data={
-                        'type': 'safety_alert',
-                        'alert_id': alert_id,
-                        'sender_id': user_id,
-                        'sender_name': sender_name,
-                        'latitude': '' if lat is None else str(lat),
-                        'longitude': '' if lng is None else str(lng),
-                        'recorded_at': str(alert.get('recorded_at') or ''),
-                    },
-                    token=token,
-                ))
-            except messaging.UnregisteredError:
-                status = 'failed'
-                try:  # dead token (e.g. an old FlowPay install): clear it
-                    requests.patch(
-                        _alert_sb('users'),
-                        headers=_supabase_headers(),
-                        params={'id': f'eq.{cid}'},
-                        json={'fcm_token': None},
-                        timeout=_SB_TIMEOUT,
-                    )
-                except Exception:
-                    pass
-            except Exception as e:
-                logging.error(f"alert {alert_id}: push to {cid} failed: {e}")
-                status = 'failed'
-
-            deliveries.append({'alert_id': alert_id, 'recipient_id': cid, 'status': status})
-
-        try:
-            requests.post(
-                _alert_sb('alert_deliveries'),
-                headers={**_supabase_headers(), 'Prefer': 'resolution=ignore-duplicates'},
-                params={'on_conflict': 'alert_id,recipient_id'},
-                json=deliveries,
-                timeout=_SB_TIMEOUT,
-            )
-        except Exception as e:
-            logging.error(f"alert {alert_id}: could not log deliveries: {e}")
-
-    except Exception as e:
-        logging.error(f"alert dispatch crashed: {e}")
-
-
-@app.route('/api/alert', methods=['POST'])
-@limiter.limit("30 per hour")
-@jwt_required()
-def create_alert():
-    user_id = get_jwt_identity()
-    data = request.get_json(silent=True) or {}
-
-    def bad(msg, code=400):
-        return jsonify({"success": False, "status": "error", "message": msg}), code
-
-    # The phone makes this id, so a retry of the same alert can never duplicate.
-    client_alert_id = str(data.get('client_alert_id', '')).lower()
-    if not _alert_valid_uuid(client_alert_id):
-        return bad("Invalid alert id")
-
-    lat, lng = data.get('latitude'), data.get('longitude')
-    if (lat is None) != (lng is None):
-        return bad("Send both coordinates or neither")
-    if lat is not None:
-        try:
-            lat, lng = float(lat), float(lng)
-        except (TypeError, ValueError):
-            return bad("Invalid coordinates")
-        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-            return bad("Coordinates out of range")
-
-    trigger = data.get('trigger_type', 'screen')
-    if trigger not in ('screen', 'volume'):
-        return bad("Invalid trigger")
-
-    try:
-        accuracy = float(data['accuracy']) if data.get('accuracy') is not None else None
-    except (TypeError, ValueError):
-        accuracy = None
-
-    recorded_at = None
-    raw_ts = data.get('recorded_at')
-    if raw_ts:
-        try:
-            recorded_at = datetime.fromisoformat(str(raw_ts).replace('Z', '+00:00')).isoformat()
-        except ValueError:
-            recorded_at = None
-
-    row = {
-        'client_alert_id': client_alert_id,
-        'user_id': user_id,
-        'latitude': lat,
-        'longitude': lng,
-        'accuracy': accuracy,
-        'recorded_at': recorded_at,
-        'trigger_type': trigger,
-        'suspected_spoof': bool(data.get('suspected_spoof', False)),
-    }
-
-    try:
-        res = requests.post(
-            _alert_sb('alerts'),
-            headers={**_supabase_headers(),
-                     'Prefer': 'resolution=ignore-duplicates,return=representation'},
-            params={'on_conflict': 'client_alert_id'},
-            json=row,
-            timeout=_SB_TIMEOUT,
-        )
-        if res.status_code not in (200, 201):
-            logging.error(f"alert insert failed: {res.status_code} {res.text}")
-            return bad("Could not save alert", 500)
-
-        rows = res.json()
-        if not rows:  # same alert id arrived again (a retry): load the original
-            ex = requests.get(
-                _alert_sb('alerts'),
-                headers=_supabase_headers(),
-                params={'client_alert_id': f'eq.{client_alert_id}',
-                        'user_id': f'eq.{user_id}', 'select': '*'},
-                timeout=_SB_TIMEOUT,
-            )
-            rows = ex.json() if ex.status_code == 200 else []
-        if not rows:
-            return bad("Could not save alert", 500)
-
-        alert = rows[0]
-        # Answer the phone now; send the pushes in the background.
-        socketio.start_background_task(_dispatch_alert, alert)
-        return jsonify({"success": True, "status": "success", "alert_id": alert['id']}), 200
-
-    except Exception as e:
-        logging.error(f"create_alert error: {e}")
-        return bad("Server error", 500)
-
-
-@app.route('/api/alerts', methods=['GET'])
-@jwt_required()
-def list_alerts():
-    user_id = get_jwt_identity()
-    try:
-        res = requests.get(
-            _alert_sb('alerts'),
-            headers=_supabase_headers(),
-            params={
-                'user_id': f'eq.{user_id}',
-                'select': 'id,latitude,longitude,triggered_at,trigger_type,'
-                          'alert_deliveries(recipient_id,status,seen_at)',
-                'order': 'triggered_at.desc',
-                'limit': '50',
-            },
-            timeout=_SB_TIMEOUT,
-        )
-        if res.status_code != 200:
-            return jsonify({"success": False, "status": "error",
-                            "message": "Could not load alerts"}), 500
-        return jsonify({"success": True, "status": "success", "alerts": res.json()}), 200
-    except Exception as e:
-        logging.error(f"list_alerts error: {e}")
-        return jsonify({"success": False, "status": "error", "message": "Server error"}), 500
-
 # ═══════════════════════════════════════════════════════════════════════════
-#  SAFELENS CIRCLE + RECEIVED ALERTS + RECORDINGS
+#  SAFELENS CIRCLE (trusted contacts)
 #
-#  Paste at the BOTTOM of routes.py, BELOW routes_alert_endpoints.py
-#  (it reuses _alert_sb, _alert_valid_uuid and _alert_contact_ids from there).
+#  Uses the mutual_contacts table (status: false = pending, true = accepted).
 #
-#  No new imports. Needs:
-#    - tables: mutual_contacts, alerts, alert_deliveries, alert_media
-#    - Render env var  R2_RECORDINGS_BUCKET  = name of a PRIVATE R2 bucket
-#      (no public URL / custom domain on it). Your existing R2 keys must be
-#      allowed to read/write that bucket.
+#    GET  /api/circle/search?q=   find users by username
+#    POST /api/circle/request     send a request (or auto-accept)
+#    GET  /api/circle             my circle + incoming + outgoing
+#    POST /api/circle/respond     accept / decline a request
+#    POST /api/circle/remove      remove a contact / cancel a request
 #
-#  Routes:
-#    GET  /api/circle/search?q=            find users by username
-#    POST /api/circle/request              send a request (or auto-accept)
-#    GET  /api/circle                      my circle + incoming + outgoing
-#    POST /api/circle/respond              accept / decline a request
-#    POST /api/circle/remove               remove a contact / cancel a request
-#    GET  /api/alerts/received             alerts sent TO me, clustered
-#    POST /api/alerts/seen                 mark alerts as seen
-#    POST /api/alerts/<id>/media/upload-url   get a private upload link
-#    POST /api/alerts/<id>/media/complete     confirm the upload finished
-#    GET  /api/alerts/<id>/media           get short-lived watch links
-#    POST /api/alerts/<id>/media/delete    sender deletes the recording
-#
-#  Old /api/search_user returns everyone's email - once the app uses
-#  /api/circle/search you can delete it.
+#  Alerts are stored in the messages table (one row per contact) and are
+#  added separately.
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 _CIRCLE_MAX_PENDING = 30
-_RECORDING_MAX_BYTES = 150 * 1024 * 1024
-_RECORDING_TYPES = {'video/mp4': 'mp4', 'video/quicktime': 'mov'}
 
 
 def _circle_bad(msg, code=400, **extra):
@@ -5034,26 +4762,364 @@ def circle_remove():
         return _circle_bad("Server error.", 500)
 
 
-# ───────────────────────── RECEIVED ALERTS ─────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  SAFELENS ALERTS  -  stored in the `messages` table
+#
+#  Paste at the BOTTOM of routes.py (below the circle routes).
+#  No new imports and no new environment variables.
+#  Run messages_alert_columns.sql first.
+#
+#  Uses what routes.py already has: fernet, _sb, r2, _supabase_headers,
+#  _SB_TIMEOUT, socketio, eventlet, messaging, R2_BUCKET_NAME and
+#  R2_PUBLIC_URL_BASE, plus the circle helpers (_alert_sb, _alert_valid_uuid,
+#  _alert_contact_ids, _alert_parse_ts, _circle_ok, _circle_bad,
+#  _circle_usernames).
+#
+#  How it works
+#    - The phone sends an alert with its own fix (or none).
+#    - If it has no fix, the server falls back to the last location saved on
+#      the user's row (the 2-minute checks).
+#    - One messages row per accepted contact, all sharing an alert_key.
+#      latitude / longitude are real columns; the rest (address, accuracy,
+#      trigger...) is a small JSON inside message_content, encrypted with
+#      your Fernet key like every other message.
+#    - The video uploads AFTERWARDS through your existing /api/get-upload-url,
+#      then /api/alert/attach-media writes its link into media_content.
+#
+#  Routes
+#    POST /api/alert               fire an alert (finger lifted)
+#    POST /api/alert/attach-media  link an uploaded clip to an alert
+#    GET  /api/alerts/sent         alerts I sent
+#    GET  /api/alerts/received     alerts sent to me, clustered
+#    POST /api/alerts/read         mark alerts as read
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ALERT_MAX_VIDEO_BYTES = 150 * 1024 * 1024
+
+
+def _alert_encode(body):
+    text = json.dumps(body, separators=(',', ':'))
+    return fernet.encrypt(text.encode()).decode() if fernet else text
+
+
+def _alert_decode(content):
+    """The alert details stored in message_content, or None if this row is not an alert."""
+    if not content:
+        return None
+    text = content
+    if fernet:
+        try:
+            text = fernet.decrypt(content.encode()).decode()
+        except Exception:
+            text = content
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) and data.get('v') == 1 else None
+
+
+def _alert_view(row, info, seen):
+    """One alert as the app expects it."""
+    return {
+        'key': row['alert_key'],
+        'user_id': row['sender_id'],
+        'sent_at': row['sent_at'],
+        'latitude': row.get('latitude'),
+        'longitude': row.get('longitude'),
+        'accuracy': info.get('accuracy'),
+        'address': info.get('address'),
+        'fix_at': info.get('fix_at'),
+        'trigger': info.get('trigger', 'screen'),
+        'source': info.get('source', 'phone'),
+        'spoof': bool(info.get('spoof', False)),
+        'expects_video': bool(info.get('expects_video', False)),
+        'media_url': row.get('media_content') or None,
+        'seen': seen,
+    }
+
+
+def _alert_push_all(sender_id, rows, lat, lng):
+    """Background: push one notification to each contact. Never raises."""
+    try:
+        recipients = [r['receiver_id'] for r in rows]
+        if not recipients:
+            return
+        name = _circle_usernames([sender_id]).get(sender_id, 'Someone')
+        quoted = ','.join(f'"{c}"' for c in recipients)
+        t = requests.get(
+            _alert_sb('users'), headers=_supabase_headers(),
+            params={'id': f'in.({quoted})', 'select': 'id,fcm_token'},
+            timeout=_SB_TIMEOUT,
+        )
+        tokens = {r['id']: r.get('fcm_token') for r in t.json()} if t.status_code == 200 else {}
+        has_loc = lat is not None and lng is not None
+        body = ("Their last known location was shared with you. Tap to open the map."
+                if has_loc else
+                "They lifted their finger, but no location was available.")
+        alert_key = rows[0].get('alert_key')
+
+        for cid in recipients:
+            token = tokens.get(cid)
+            if not token:
+                continue
+            try:
+                messaging.send(messaging.Message(
+                    notification=messaging.Notification(
+                        title=f"🚨 {name} may need help", body=body),
+                    android=messaging.AndroidConfig(
+                        priority='high',
+                        ttl=3600,  # an hour-old emergency push is worse than none
+                        notification=messaging.AndroidNotification(
+                            channel_id='safety_alerts', priority='max'),
+                    ),
+                    apns=messaging.APNSConfig(
+                        headers={'apns-priority': '10'},
+                        payload=messaging.APNSPayload(aps=messaging.Aps(sound='default')),
+                    ),
+                    data={
+                        'type': 'safety_alert',
+                        'alert_key': str(alert_key),
+                        'sender_id': sender_id,
+                        'sender_name': name,
+                        'latitude': '' if lat is None else str(lat),
+                        'longitude': '' if lng is None else str(lng),
+                    },
+                    token=token,
+                ))
+            except messaging.UnregisteredError:
+                try:  # dead token: clear it
+                    requests.patch(
+                        _alert_sb('users'), headers=_supabase_headers(),
+                        params={'id': f'eq.{cid}'}, json={'fcm_token': None},
+                        timeout=_SB_TIMEOUT,
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                logging.error(f"alert push to {cid} failed: {e}")
+    except Exception as e:
+        logging.error(f"alert push crashed: {e}")
+
+
+@app.route('/api/alert', methods=['POST'])
+@limiter.limit("30 per hour")
+@jwt_required()
+def fire_alert():
+    me = get_jwt_identity()
+    data = request.get_json(silent=True) or {}
+
+    def bad(msg, code=400):
+        return _circle_bad(msg, code)
+
+    alert_key = str(data.get('alert_key', '')).lower()
+    if not _alert_valid_uuid(alert_key):
+        return bad("Invalid alert id")
+
+    lat, lng = data.get('latitude'), data.get('longitude')
+    if (lat is None) != (lng is None):
+        return bad("Send both coordinates or neither")
+    if lat is not None:
+        try:
+            lat, lng = float(lat), float(lng)
+        except (TypeError, ValueError):
+            return bad("Invalid coordinates")
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return bad("Coordinates out of range")
+
+    trigger = data.get('trigger_type', 'screen')
+    if trigger not in ('screen', 'volume'):
+        return bad("Invalid trigger")
+
+    try:
+        accuracy = float(data['accuracy']) if data.get('accuracy') is not None else None
+    except (TypeError, ValueError):
+        accuracy = None
+
+    fix_at = None
+    if data.get('fix_at'):
+        try:
+            fix_at = _alert_parse_ts(data['fix_at']).isoformat()
+        except Exception:
+            fix_at = None
+
+    address = str(data.get('address') or '').strip()[:200] or None
+    source = 'phone'
+
+    try:
+        contacts = _alert_contact_ids(me)
+        if not contacts:
+            return _circle_ok(alert_key=alert_key, contacts=0)
+
+        # No fix from the phone? Fall back to the last location saved on the user's row.
+        if lat is None:
+            u = requests.get(
+                _alert_sb('users'), headers=_supabase_headers(),
+                params={'id': f'eq.{me}', 'select': 'latitude,longitude', 'limit': '1'},
+                timeout=_SB_TIMEOUT,
+            )
+            rows = u.json() if u.status_code == 200 else []
+            if rows and rows[0].get('latitude') is not None and rows[0].get('longitude') is not None:
+                lat, lng = float(rows[0]['latitude']), float(rows[0]['longitude'])
+                source = 'last_known'
+            else:
+                source = 'none'
+
+        content = _alert_encode({
+            'v': 1,
+            'address': address,
+            'accuracy': accuracy,
+            'fix_at': fix_at,
+            'trigger': trigger,
+            'source': source,
+            'spoof': bool(data.get('suspected_spoof', False)),
+            'expects_video': bool(data.get('expects_video', False)),
+        })
+
+        new_rows = [{
+            'sender_id': me,
+            'receiver_id': cid,
+            'message_content': content,
+            'latitude': lat,
+            'longitude': lng,
+            'alert_key': alert_key,
+            'is_read': False,
+        } for cid in contacts]
+
+        res = _sb.post(
+            _alert_sb('messages'),
+            headers={**_supabase_headers(),
+                     'Prefer': 'resolution=ignore-duplicates,return=representation'},
+            params={'on_conflict': 'alert_key,receiver_id'},
+            json=new_rows,
+            timeout=_SB_TIMEOUT,
+        )
+        if res.status_code not in (200, 201):
+            logging.error(f"alert insert failed: {res.status_code} {res.text}")
+            return bad("Could not save alert", 500)
+
+        inserted = res.json()
+        if inserted:  # a repeat of an alert we already stored inserts nothing: no second push
+            socketio.start_background_task(_alert_push_all, me, inserted, lat, lng)
+        return _circle_ok(alert_key=alert_key, contacts=len(contacts), source=source)
+    except Exception as e:
+        logging.error(f"fire_alert error: {e}")
+        return bad("Server error", 500)
+
+
+@app.route('/api/alert/attach-media', methods=['POST'])
+@limiter.limit("30 per hour")
+@jwt_required()
+def alert_attach_media():
+    me = get_jwt_identity()
+    data = request.get_json(silent=True) or {}
+    alert_key = str(data.get('alert_key', '')).lower()
+    media_url = str(data.get('media_url', '')).strip()
+    if not _alert_valid_uuid(alert_key):
+        return _circle_bad("Invalid alert id")
+
+    # The link must be exactly what /api/get-upload-url hands out for THIS user
+    # and THIS alert. Nothing else can be attached.
+    base = (os.getenv('R2_PUBLIC_URL_BASE') or '').rstrip('/')
+    prefix = f"{base}/posts/{me}/alert-{alert_key}."
+    if not base or not media_url.startswith(prefix) or media_url[len(prefix):] not in ('mp4', 'mov'):
+        return _circle_bad("Invalid video link")
+
+    key = media_url[len(base) + 1:]
+    try:
+        try:
+            head = eventlet.tpool.execute(r2.head_object, Bucket=os.getenv('R2_BUCKET_NAME'), Key=key)
+        except Exception:
+            return _circle_bad("Upload not found. Please try again.")
+        size = int(head.get('ContentLength', 0))
+        if size <= 0 or size > _ALERT_MAX_VIDEO_BYTES:
+            return _circle_bad("Video has an invalid size.")
+
+        res = requests.patch(
+            _alert_sb('messages'),
+            headers={**_supabase_headers(), 'Prefer': 'return=representation'},
+            params={'sender_id': f'eq.{me}', 'alert_key': f'eq.{alert_key}'},
+            json={'media_content': media_url},
+            timeout=_SB_TIMEOUT,
+        )
+        if res.status_code != 200 or not res.json():
+            return _circle_bad("Alert not found.", 404)
+        return _circle_ok()
+    except Exception as e:
+        logging.error(f"alert_attach_media error: {e}")
+        return _circle_bad("Server error", 500)
+
+
+@app.route('/api/alerts/sent', methods=['GET'])
+@jwt_required()
+def alerts_sent():
+    me = get_jwt_identity()
+    try:
+        res = requests.get(
+            _alert_sb('messages'), headers=_supabase_headers(),
+            params={
+                'sender_id': f'eq.{me}',
+                'alert_key': 'not.is.null',
+                'select': 'receiver_id,message_content,media_content,latitude,longitude,'
+                          'alert_key,sent_at,is_read,read_at',
+                'order': 'sent_at.desc',
+                'limit': '300',
+            },
+            timeout=_SB_TIMEOUT,
+        )
+        if res.status_code != 200:
+            logging.error(f"alerts_sent query failed: {res.text}")
+            return _circle_bad("Could not load alerts.", 500)
+
+        groups, order = {}, []
+        for r in res.json():
+            info = _alert_decode(r.get('message_content'))
+            if info is None:
+                continue
+            k = r['alert_key']
+            if k not in groups:
+                groups[k] = {'row': dict(r, sender_id=me), 'info': info, 'deliveries': []}
+                order.append(k)
+            groups[k]['deliveries'].append({
+                'receiver_id': r['receiver_id'],
+                'is_read': bool(r.get('is_read')),
+                'read_at': r.get('read_at'),
+            })
+            if r.get('media_content') and not groups[k]['row'].get('media_content'):
+                groups[k]['row']['media_content'] = r['media_content']
+
+        names = _circle_usernames([d['receiver_id'] for g in groups.values() for d in g['deliveries']])
+        alerts = []
+        for k in order:
+            g = groups[k]
+            item = _alert_view(g['row'], g['info'], True)
+            for d in g['deliveries']:
+                d['username'] = names.get(d['receiver_id'], 'Someone')
+            item['deliveries'] = g['deliveries']
+            alerts.append(item)
+        return _circle_ok(alerts=alerts)
+    except Exception as e:
+        logging.error(f"alerts_sent error: {e}")
+        return _circle_bad("Server error", 500)
+
 
 @app.route('/api/alerts/received', methods=['GET'])
 @jwt_required()
 def alerts_received():
     me = get_jwt_identity()
     try:
-        # Removing someone from your circle also removes their old alerts.
+        # Removing someone from your circle also hides their old alerts.
         contacts = set(_alert_contact_ids(me))
         if not contacts:
             return _circle_ok(clusters=[], unseen=0)
 
         res = requests.get(
-            _alert_sb('alert_deliveries'),
-            headers=_supabase_headers(),
+            _alert_sb('messages'), headers=_supabase_headers(),
             params={
-                'recipient_id': f'eq.{me}',
-                'select': 'alert_id,seen_at,sent_at,'
-                          'alerts(id,user_id,latitude,longitude,accuracy,recorded_at,'
-                          'triggered_at,trigger_type,alert_media(part,status,duration_ms))',
+                'receiver_id': f'eq.{me}',
+                'alert_key': 'not.is.null',
+                'select': 'sender_id,message_content,media_content,latitude,longitude,'
+                          'alert_key,sent_at,is_read',
                 'order': 'sent_at.desc',
                 'limit': '300',
             },
@@ -5064,27 +5130,15 @@ def alerts_received():
             return _circle_bad("Could not load alerts.", 500)
 
         items = []
-        for d in res.json():
-            a = d.get('alerts')
-            if not a or a['user_id'] not in contacts:
+        for r in res.json():
+            if r['sender_id'] not in contacts:
                 continue
-            all_media = a.get('alert_media') or []
-            ready = sorted([m for m in all_media if m.get('status') == 'ready'],
-                           key=lambda m: m.get('part', 0))
-            if ready:
-                media = {'status': 'ready', 'duration_ms': ready[0].get('duration_ms')}
-            elif any(m.get('status') == 'pending' for m in all_media):
-                media = {'status': 'pending'}
-            else:
-                media = None
-            items.append({
-                'id': a['id'], 'user_id': a['user_id'],
-                'latitude': a.get('latitude'), 'longitude': a.get('longitude'),
-                'accuracy': a.get('accuracy'), 'recorded_at': a.get('recorded_at'),
-                'triggered_at': a['triggered_at'], 'trigger_type': a.get('trigger_type'),
-                'seen': d.get('seen_at') is not None, 'media': media,
-                '_t': _alert_parse_ts(a['triggered_at']),
-            })
+            info = _alert_decode(r.get('message_content'))
+            if info is None:
+                continue
+            item = _alert_view(r, info, bool(r.get('is_read')))
+            item['_t'] = _alert_parse_ts(r['sent_at'])
+            items.append(item)
 
         now = datetime.now(timezone.utc)
         by_user = {}
@@ -5119,7 +5173,6 @@ def alerts_received():
                     'escalating': escalating,
                     'count': len(g),
                     'unseen': sum(1 for x in g if not x['seen']),
-                    'latest_at': g[-1]['triggered_at'],
                     'alerts': [{k: v for k, v in x.items() if k != '_t'} for x in reversed(g)],
                     '_sort': latest,
                 })
@@ -5130,234 +5183,27 @@ def alerts_received():
         return _circle_ok(clusters=clusters, unseen=sum(c['unseen'] for c in clusters))
     except Exception as e:
         logging.error(f"alerts_received error: {e}")
-        return _circle_bad("Server error.", 500)
+        return _circle_bad("Server error", 500)
 
 
-@app.route('/api/alerts/seen', methods=['POST'])
+@app.route('/api/alerts/read', methods=['POST'])
 @jwt_required()
-def alerts_mark_seen():
+def alerts_mark_read():
     me = get_jwt_identity()
-    raw = (request.get_json(silent=True) or {}).get('alert_ids') or []
-    ids = [str(i).lower() for i in raw][:50]
-    ids = [i for i in ids if _alert_valid_uuid(i)]
-    if not ids:
+    raw = (request.get_json(silent=True) or {}).get('alert_keys') or []
+    keys = [str(k).lower() for k in raw][:50]
+    keys = [k for k in keys if _alert_valid_uuid(k)]
+    if not keys:
         return _circle_ok()
     try:
-        quoted = ','.join(f'"{i}"' for i in ids)
         requests.patch(
-            _alert_sb('alert_deliveries'), headers=_supabase_headers(),
-            params={'recipient_id': f'eq.{me}', 'alert_id': f'in.({quoted})',
-                    'seen_at': 'is.null'},
-            json={'seen_at': _circle_now()}, timeout=_SB_TIMEOUT,
-        )
-        return _circle_ok()
-    except Exception as e:
-        logging.error(f"alerts_mark_seen error: {e}")
-        return _circle_bad("Server error.", 500)
-
-
-# ───────────────────────────── RECORDINGS ─────────────────────────────
-
-def _alert_owner(alert_id):
-    res = requests.get(
-        _alert_sb('alerts'), headers=_supabase_headers(),
-        params={'id': f'eq.{alert_id}', 'select': 'id,user_id', 'limit': '1'},
-        timeout=_SB_TIMEOUT,
-    )
-    rows = res.json() if res.status_code == 200 else []
-    return rows[0]['user_id'] if rows else None
-
-
-def _alert_can_view(alert_id, me):
-    """Owner, or someone who was alerted AND is still an accepted contact."""
-    owner = _alert_owner(alert_id)
-    if not owner:
-        return False
-    if owner == me:
-        return True
-    d = requests.get(
-        _alert_sb('alert_deliveries'), headers=_supabase_headers(),
-        params={'alert_id': f'eq.{alert_id}', 'recipient_id': f'eq.{me}',
-                'select': 'alert_id', 'limit': '1'},
-        timeout=_SB_TIMEOUT,
-    )
-    if d.status_code != 200 or not d.json():
-        return False
-    return owner in _alert_contact_ids(me)
-
-
-def _recording_row(alert_id, part=0):
-    res = requests.get(
-        _alert_sb('alert_media'), headers=_supabase_headers(),
-        params={'alert_id': f'eq.{alert_id}', 'part': f'eq.{part}',
-                'select': 'id,r2_key,status', 'limit': '1'},
-        timeout=_SB_TIMEOUT,
-    )
-    rows = res.json() if res.status_code == 200 else []
-    return rows[0] if rows else None
-
-
-@app.route('/api/alerts/<string:alert_id>/media/upload-url', methods=['POST'])
-@limiter.limit("20 per hour")
-@jwt_required()
-def alert_media_upload_url(alert_id):
-    me = get_jwt_identity()
-    alert_id = alert_id.lower()
-    if not _alert_valid_uuid(alert_id):
-        return _circle_bad("Invalid alert.")
-    data = request.get_json(silent=True) or {}
-    ctype = str(data.get('content_type', 'video/mp4'))
-    try:
-        size = int(data.get('size_bytes') or 0)
-        duration = int(data.get('duration_ms') or 0) or None
-    except (TypeError, ValueError):
-        return _circle_bad("Invalid size.")
-    if ctype not in _RECORDING_TYPES:
-        return _circle_bad("Unsupported video type.")
-    if size <= 0 or size > _RECORDING_MAX_BYTES:
-        return _circle_bad("Video is too large.")
-    bucket = os.getenv('R2_RECORDINGS_BUCKET')
-    if not bucket:
-        logging.error("R2_RECORDINGS_BUCKET is not set")
-        return _circle_bad("Recording upload is not configured.", 500)
-    try:
-        if _alert_owner(alert_id) != me:
-            return _circle_bad("Alert not found.", 404)
-
-        existing = _recording_row(alert_id)
-        if existing and existing['status'] == 'ready':
-            return _circle_bad("Recording already uploaded.", 409)
-
-        if existing:
-            key = existing['r2_key']
-            requests.patch(
-                _alert_sb('alert_media'), headers=_supabase_headers(),
-                params={'id': f"eq.{existing['id']}"},
-                json={'content_type': ctype, 'size_bytes': size, 'duration_ms': duration},
-                timeout=_SB_TIMEOUT,
-            )
-        else:
-            key = f"recordings/{me}/{alert_id}/0-{uuid.uuid4().hex}.{_RECORDING_TYPES[ctype]}"
-            ins = requests.post(
-                _alert_sb('alert_media'), headers=_supabase_headers(),
-                json={'alert_id': alert_id, 'user_id': me, 'part': 0, 'r2_key': key,
-                      'content_type': ctype, 'size_bytes': size,
-                      'duration_ms': duration, 'status': 'pending'},
-                timeout=_SB_TIMEOUT,
-            )
-            if ins.status_code not in (200, 201, 204):
-                logging.error(f"alert_media insert failed: {ins.text}")
-                return _circle_bad("Could not prepare upload.", 500)
-
-        signed = eventlet.tpool.execute(
-            r2.generate_presigned_url, 'put_object',
-            Params={'Bucket': bucket, 'Key': key, 'ContentType': ctype},
-            ExpiresIn=1800,
-        )
-        return _circle_ok(upload_url=signed, content_type=ctype)
-    except Exception as e:
-        logging.error(f"alert_media_upload_url error: {e}")
-        return _circle_bad("Server error.", 500)
-
-
-@app.route('/api/alerts/<string:alert_id>/media/complete', methods=['POST'])
-@jwt_required()
-def alert_media_complete(alert_id):
-    me = get_jwt_identity()
-    alert_id = alert_id.lower()
-    if not _alert_valid_uuid(alert_id):
-        return _circle_bad("Invalid alert.")
-    bucket = os.getenv('R2_RECORDINGS_BUCKET')
-    try:
-        if _alert_owner(alert_id) != me:
-            return _circle_bad("Alert not found.", 404)
-        row = _recording_row(alert_id)
-        if not row:
-            return _circle_bad("No upload started for this alert.", 404)
-
-        try:
-            head = eventlet.tpool.execute(r2.head_object, Bucket=bucket, Key=row['r2_key'])
-        except Exception:
-            return _circle_bad("Upload not found. Please try again.")
-        size = int(head.get('ContentLength', 0))
-        if size <= 0 or size > _RECORDING_MAX_BYTES:
-            try:
-                eventlet.tpool.execute(r2.delete_object, Bucket=bucket, Key=row['r2_key'])
-            except Exception:
-                pass
-            return _circle_bad("Uploaded video has an invalid size.")
-
-        requests.patch(
-            _alert_sb('alert_media'), headers=_supabase_headers(),
-            params={'id': f"eq.{row['id']}"},
-            json={'status': 'ready', 'size_bytes': size, 'uploaded_at': _circle_now()},
+            _alert_sb('messages'), headers=_supabase_headers(),
+            params={'receiver_id': f'eq.{me}', 'alert_key': f"in.({','.join(keys)})",
+                    'is_read': 'eq.false'},
+            json={'is_read': True, 'read_at': datetime.now(timezone.utc).isoformat()},
             timeout=_SB_TIMEOUT,
         )
         return _circle_ok()
     except Exception as e:
-        logging.error(f"alert_media_complete error: {e}")
-        return _circle_bad("Server error.", 500)
-
-
-@app.route('/api/alerts/<string:alert_id>/media', methods=['GET'])
-@jwt_required()
-def alert_media_get(alert_id):
-    me = get_jwt_identity()
-    alert_id = alert_id.lower()
-    if not _alert_valid_uuid(alert_id):
-        return _circle_bad("Invalid alert.")
-    bucket = os.getenv('R2_RECORDINGS_BUCKET')
-    try:
-        if not _alert_can_view(alert_id, me):
-            return _circle_bad("Not found.", 404)  # 404 on purpose: don't reveal what exists
-
-        res = requests.get(
-            _alert_sb('alert_media'), headers=_supabase_headers(),
-            params={'alert_id': f'eq.{alert_id}', 'status': 'eq.ready',
-                    'select': 'part,r2_key,content_type,duration_ms', 'order': 'part.asc'},
-            timeout=_SB_TIMEOUT,
-        )
-        rows = res.json() if res.status_code == 200 else []
-        media = []
-        for r in rows:
-            url = eventlet.tpool.execute(
-                r2.generate_presigned_url, 'get_object',
-                Params={'Bucket': bucket, 'Key': r['r2_key']}, ExpiresIn=3600,
-            )
-            media.append({'part': r['part'], 'content_type': r['content_type'],
-                          'duration_ms': r.get('duration_ms'), 'url': url})
-        return _circle_ok(media=media)
-    except Exception as e:
-        logging.error(f"alert_media_get error: {e}")
-        return _circle_bad("Server error.", 500)
-
-
-@app.route('/api/alerts/<string:alert_id>/media/delete', methods=['POST'])
-@jwt_required()
-def alert_media_delete(alert_id):
-    me = get_jwt_identity()
-    alert_id = alert_id.lower()
-    if not _alert_valid_uuid(alert_id):
-        return _circle_bad("Invalid alert.")
-    bucket = os.getenv('R2_RECORDINGS_BUCKET')
-    try:
-        if _alert_owner(alert_id) != me:
-            return _circle_bad("Alert not found.", 404)
-        res = requests.get(
-            _alert_sb('alert_media'), headers=_supabase_headers(),
-            params={'alert_id': f'eq.{alert_id}', 'select': 'r2_key'},
-            timeout=_SB_TIMEOUT,
-        )
-        for r in (res.json() if res.status_code == 200 else []):
-            try:
-                eventlet.tpool.execute(r2.delete_object, Bucket=bucket, Key=r['r2_key'])
-            except Exception as e:
-                logging.error(f"R2 delete failed for {r['r2_key']}: {e}")
-        requests.delete(
-            _alert_sb('alert_media'), headers=_supabase_headers(),
-            params={'alert_id': f'eq.{alert_id}'}, timeout=_SB_TIMEOUT,
-        )
-        return _circle_ok()
-    except Exception as e:
-        logging.error(f"alert_media_delete error: {e}")
-        return _circle_bad("Server error.", 500)
+        logging.error(f"alerts_mark_read error: {e}")
+        return _circle_bad("Server error", 500)
