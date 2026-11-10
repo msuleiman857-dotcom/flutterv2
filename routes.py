@@ -4864,18 +4864,25 @@ def _alert_push_all(sender_id, rows, lat, lng):
             if not token:
                 continue
             try:
+                # ANDROID gets a DATA-ONLY message (no `notification` block).
+                # That is what lets the Flutter background handler draw the
+                # sticky, vibrating notification itself, even when the app is
+                # closed. With a `notification` block Android would draw its
+                # own plain one and our code would never run.
+                # iOS cannot run code for data-only pushes reliably, so it
+                # keeps a normal visible alert through the apns section.
                 messaging.send(messaging.Message(
-                    notification=messaging.Notification(
-                        title=f"🚨 {name} may need help", body=body),
                     android=messaging.AndroidConfig(
                         priority='high',
                         ttl=3600,  # an hour-old emergency push is worse than none
-                        notification=messaging.AndroidNotification(
-                            channel_id='safety_alerts', priority='max'),
                     ),
                     apns=messaging.APNSConfig(
                         headers={'apns-priority': '10'},
-                        payload=messaging.APNSPayload(aps=messaging.Aps(sound='default')),
+                        payload=messaging.APNSPayload(aps=messaging.Aps(
+                            alert=messaging.ApsAlert(
+                                title=f"🚨 {name} may need help", body=body),
+                            sound='default',
+                        )),
                     ),
                     data={
                         'type': 'safety_alert',
