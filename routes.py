@@ -213,8 +213,12 @@ def handle_disconnect():
             break
 
 @app.route('/')
-def health():
+def base():
     return jsonify({"status": "haha"}), 200
+
+@app.get('/health')
+def health():
+    return {'status': 'ok'}
 
 def _find_user_id_by_customer_id(customer_id):
     if not customer_id:
