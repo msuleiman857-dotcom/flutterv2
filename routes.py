@@ -140,6 +140,10 @@ def _get_profile_pic(user_id):
 
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
 BRIDGE_KEY = os.getenv("BRIDGE_KEY")
+KORA_API = (os.getenv('KORA_API'))
+PREMIUM_PRICE = int(os.getenv('PREMIUM_PRICE_NAIRA'))
+PREMIUM_DAYS = int(os.getenv('PREMIUM_DAYS'))
+PUBLIC_URL = (os.getenv('PUBLIC_BASE_URL'))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FIREBASE_KEY_PATH = os.path.join(BASE_DIR, "firebase")
@@ -2865,3 +2869,243 @@ def alerts_mark_read():
     except Exception as e:
         logging.error(f"alerts_mark_read error: {e}")
         return _circle_bad("Server error", 500)
+
+# Every limit lives here. The premium page, /api/entitlements and the
+# enforcement all read this, so changing a number changes them all.
+PLAN_LIMITS = {
+    'free':    {'circle_max': 2,  'alerts_per_day': 6,  'max_video_secs': 30,
+                'can_download': False, 'can_use_map': False},
+    'premium': {'circle_max': 10, 'alerts_per_day': 30, 'max_video_secs': 120,
+                'can_download': True,  'can_use_map': True},
+}
+
+
+def premium_status(user_id):
+    """Premium = premium_until is in the future. is_premium=true with NO date is a
+    manual grant that never expires. Returns None if Supabase failed."""
+    try:
+        r = requests.get(_alert_sb('users'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                         params={'id': f'eq.{user_id}', 'select': 'is_premium,premium_until'})
+        r.raise_for_status()
+        row = (r.json() or [{}])[0]
+        until = _alert_parse_ts(row['premium_until']) if row.get('premium_until') else None
+        active = until > datetime.now(timezone.utc) if until else bool(row.get('is_premium'))
+        if until and row.get('is_premium') and not active:        # expired: drop the stale flag
+            requests.patch(_alert_sb('users'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                           params={'id': f'eq.{user_id}'}, json={'is_premium': False})
+        return {'is_premium': active,
+                'premium_until': until.isoformat() if until else None,
+                'plan': PLAN_LIMITS['premium' if active else 'free']}
+    except Exception as e:
+        logging.error(f"premium_status error: {e}")
+        return None
+
+
+def premium_settle(ref):
+    """Confirm ONE payment with Korapay, then apply it exactly once.
+    The webhook, the callback page and the offer poll all call this, in any order
+    or all at once. -> paid | already | pending | failed | underpaid | unknown | error"""
+    try:
+        o = requests.get(_alert_sb('premium_orders'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                         params={'reference': f'eq.{ref}', 'select': 'status'})
+        o.raise_for_status()
+        rows = o.json()
+        if not rows:
+            return 'unknown'
+        if rows[0]['status'] == 'paid':
+            return 'already'
+
+        # Never trust a webhook or a redirect. Ask Korapay directly.
+        k = requests.get(f'{KORA_API}/charges/{ref}', timeout=12,
+                         headers={'Authorization': f"Bearer {os.getenv('KORAPAY_SECRET_KEY')}"})
+        if k.status_code == 404:
+            return 'pending'                                      # not paid yet
+        k.raise_for_status()
+        charge = k.json().get('data') or {}
+        if charge.get('reference') not in (None, ref):
+            return 'error'
+        state = str(charge.get('status', '')).lower()
+
+        if state == 'success':       # applied inside ONE database transaction (premium.sql)
+            a = requests.post(_alert_sb('rpc/apply_premium_order'), headers=_supabase_headers(),
+                              timeout=_SB_TIMEOUT,
+                              json={'p_reference': ref, 'p_amount': float(charge.get('amount') or 0)})
+            a.raise_for_status()
+            result = a.json().get('result', 'error')
+            logging.info(f"premium order {ref}: {result}")
+            return result
+        if state == 'failed':
+            requests.patch(_alert_sb('premium_orders'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                           params={'reference': f'eq.{ref}', 'status': 'eq.pending'},
+                           json={'status': 'failed'})
+            return 'failed'
+        return 'pending'
+    except Exception as e:
+        logging.error(f"premium_settle error: {e}")
+        return 'error'
+
+
+# ── what the premium page shows: price, days, features, and who you are ─────
+@app.route('/api/premium/offer', methods=['GET'])
+@jwt_required()
+def premium_offer():
+    me = get_jwt_identity()
+    try:    # webhook never arrived (server asleep)? re-check this user's recent pending orders
+        since = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        for o in requests.get(_alert_sb('premium_orders'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                              params={'user_id': f'eq.{me}', 'status': 'eq.pending',
+                                      'created_at': f'gte.{since}', 'select': 'reference',
+                                      'order': 'created_at.desc', 'limit': '2'}).json():
+            premium_settle(o['reference'])
+    except Exception as e:
+        logging.error(f"premium_offer reconcile error: {e}")
+
+    st = premium_status(me)
+    if st is None:
+        return _circle_bad('Could not load premium right now.', 500)
+
+    free, paid = PLAN_LIMITS['free'], PLAN_LIMITS['premium']
+    dur = lambda s: f"{s // 60} minute{'s' if s > 60 else ''}" if s % 60 == 0 else f"{s} seconds"
+    return _circle_ok(
+        is_premium=st['is_premium'], premium_until=st['premium_until'],
+        price_naira=PREMIUM_PRICE, days=PREMIUM_DAYS,
+        period='month' if PREMIUM_DAYS == 30 else f'{PREMIUM_DAYS} days',
+        features=[
+            {'icon': 'circle', 'title': f"Up to {paid['circle_max']} trusted contacts",
+             'detail': f"Free accounts can add {free['circle_max']}."},
+            {'icon': 'alerts', 'title': f"{paid['alerts_per_day']} alerts a day",
+             'detail': f"Free accounts get {free['alerts_per_day']}."},
+            {'icon': 'video', 'title': f"Record up to {dur(paid['max_video_secs'])}",
+             'detail': f"Free recordings stop at {dur(free['max_video_secs'])}."},
+            {'icon': 'map', 'title': 'Live map on every alert',
+             'detail': 'Free accounts see a pin and coordinates.'},
+            {'icon': 'download', 'title': 'Save videos to your phone',
+             'detail': 'Download any video alert you receive.'},
+        ])
+
+
+# ── what this user is allowed to do right now (the app caches this) ─────────
+@app.route('/api/entitlements', methods=['GET'])
+@jwt_required()
+def premium_entitlements():
+    st = premium_status(get_jwt_identity())
+    if st is None:
+        return _circle_bad('Could not load your plan right now.', 500)
+    return _circle_ok(is_premium=st['is_premium'], premium_until=st['premium_until'], **st['plan'])
+
+
+# ── Pay button: create the order, hand back Korapay's checkout link ─────────
+@app.route('/api/premium/checkout', methods=['POST'])
+@limiter.limit('10 per hour')
+@jwt_required()
+def premium_checkout():
+    me = get_jwt_identity()
+    key = os.getenv('KORAPAY_SECRET_KEY')
+    if not key:
+        return _circle_bad('Payments are not available right now.', 503)
+    try:
+        u = requests.get(_alert_sb('users'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                         params={'id': f'eq.{me}', 'select': 'username,email'}).json()
+        if not u or not u[0].get('email'):
+            return _circle_bad('Your account has no email. Add one first.')
+
+        # The price is decided HERE. The app never sends an amount, name or email.
+        ref = str(uuid.uuid4())
+        requests.post(_alert_sb('premium_orders'), headers={**_supabase_headers(), 'Prefer': 'return=minimal'},
+                      timeout=_SB_TIMEOUT,
+                      json={'reference': ref, 'user_id': me, 'amount': PREMIUM_PRICE,
+                            'days': PREMIUM_DAYS}).raise_for_status()
+
+        k = requests.post(f'{KORA_API}/charges/initialize', timeout=20,
+                          headers={'Authorization': f'Bearer {key}'},
+                          json={'reference': ref, 'amount': PREMIUM_PRICE, 'currency': 'NGN',
+                                'narration': 'SafeLens Premium', 'merchant_bears_cost': False,
+                                'redirect_url': f'{PUBLIC_URL}/premium/callback',
+                                'notification_url': f'{PUBLIC_URL}/api/premium/webhook',
+                                'customer': {'name': u[0].get('username') or 'Customer',
+                                             'email': u[0]['email']}})
+        url = (k.json().get('data') or {}).get('checkout_url')
+        if not k.ok or not url:
+            logging.error(f"korapay initialize failed: {k.status_code} {k.text[:300]}")
+            requests.patch(_alert_sb('premium_orders'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                           params={'reference': f'eq.{ref}'}, json={'status': 'failed'})
+            return _circle_bad('Could not reach the payment provider. Try again.', 502)
+        return _circle_ok(checkout_url=url, reference=ref)
+    except Exception as e:
+        logging.error(f"premium_checkout error: {e}")
+        return _circle_bad('Could not start the payment. Try again.', 500)
+
+
+# ── Korapay -> us.  Signed, but we still confirm with Korapay before applying ─
+@app.route('/api/premium/webhook', methods=['POST'])
+def premium_webhook():
+    secret = os.getenv('KORAPAY_SECRET_KEY')
+    if not secret:
+        return '', 503
+    try:    # whole-number amounts are read as ints so we re-sign them exactly like JSON.stringify
+        body = json.loads(request.get_data(),
+                          parse_float=lambda s: int(float(s)) if float(s).is_integer() else float(s))
+        ref = body['data']['reference']
+        signed = json.dumps(body['data'], separators=(',', ':'), ensure_ascii=False)
+    except (ValueError, KeyError, TypeError):
+        return '', 200
+
+    # Korapay signs ONLY the `data` object: HMAC-SHA256 (hex) with your secret key.
+    expected = hmac.new(secret.encode(), signed.encode(), hashlib.sha256).hexdigest()
+    sent = request.headers.get('x-korapay-signature', '').strip().lower()
+    if not hmac.compare_digest(expected.encode(), sent.encode()):
+        logging.warning('premium webhook: signature did not match, ignored')
+        return '', 200
+
+    if str(body.get('event', '')).startswith('charge.') and _alert_valid_uuid(ref):
+        if premium_settle(ref) == 'error':
+            return '', 500                      # transient problem: Korapay will retry
+    return '', 200
+
+
+# ── the page the user lands on after paying (in their browser, not the app) ──
+_PREMIUM_PAGES = {
+    'paid':      ('#8fd9b6', 'Payment received', 'Premium is active. You can close this tab and go back to SafeLens.'),
+    'pending':   ('#f5b942', 'Payment is processing', 'This can take a minute. Go back to SafeLens and tap Check again.'),
+    'error':     ('#f5b942', 'We could not confirm it yet', 'Go back to SafeLens and tap Check again in a minute.'),
+    'failed':    ('#f2735b', 'Payment did not go through', 'Go back to SafeLens to try again.'),
+    'underpaid': ('#f2735b', 'Amount was too low', 'The amount received was less than the price. Please contact support.'),
+    'unknown':   ('#f2735b', 'Link not recognised', 'Go back to SafeLens and start again.'),
+}
+
+
+@app.route('/premium/callback', methods=['GET'])
+@limiter.limit('60 per minute')
+def premium_callback():
+    ref = request.args.get('reference', '')
+    result = premium_settle(ref) if _alert_valid_uuid(ref) else 'unknown'
+    color, title, text = _PREMIUM_PAGES.get('paid' if result == 'already' else result,
+                                            _PREMIUM_PAGES['unknown'])
+    return Response(
+        '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>SafeLens</title>'
+        '<body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;'
+        'background:#0f0f10;color:#f4efe6;font-family:system-ui,sans-serif">'
+        '<div style="max-width:420px;margin:24px;padding:34px 28px;border-radius:28px;background:#1b1b1d;text-align:center">'
+        f'<div style="width:16px;height:16px;border-radius:50%;background:{color};margin:0 auto 20px"></div>'
+        f'<h1 style="font-size:24px;margin:0 0 10px">{title}</h1>'
+        f'<p style="margin:0;color:#b9b3a8;line-height:1.55">{text}</p></div></body>',
+        mimetype='text/html')
+
+
+# ── replacements for the two old functions you deleted ──────────────────────
+@app.route('/api/user/<string:user_id>/premium', methods=['GET'])
+@jwt_required()
+def check_premium_status(user_id):
+    """Is this user premium? (the camera drawer asks this)"""
+    if str(user_id) != get_jwt_identity():
+        return _circle_bad('Unauthorized action', 403)
+    st = premium_status(user_id)
+    if st is None:
+        return _circle_bad('Database error', 500)
+    return _circle_ok(is_premium=st['is_premium'], premium_until=st['premium_until'])
+
+
+def is_premium_user(conn, user_id):
+    st = premium_status(user_id)
+    return bool(st and st['is_premium'])
