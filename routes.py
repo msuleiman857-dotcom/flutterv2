@@ -1984,49 +1984,6 @@ def api_update_profile_pic():
         logging.error(f"Update profile pic error: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
 
-@app.route('/api/user/<string:user_id>/premium', methods=['GET'])
-@jwt_required()
-def check_premium_status(user_id):
-    """Check if a user has premium status"""
-    if str(user_id) != get_jwt_identity():
-        return jsonify({"status": "error", "message": "Unauthorized action"}), 403
-
-    try:
-        # ✨ HTTPS FIREWALL BYPASS ✨
-        url = f"{os.getenv('SUPABASE_URL')}/rest/v1/users"
-        headers = {
-            "apikey": os.getenv('SUPABASE_SERVICE_KEY'),
-            "Authorization": f"Bearer {os.getenv('SUPABASE_SERVICE_KEY')}"
-        }
-
-        # Ask Supabase to only SELECT the is_premium column WHERE id = user_id
-        params = {
-            "id": f"eq.{user_id}",
-            "select": "is_premium"
-        }
-
-        response = requests.get(url, headers=headers, params=params)
-
-        if response.status_code == 200:
-            data = response.json()
-            is_premium = False
-
-            # If we got data back, read the boolean value
-            if data and len(data) > 0:
-                is_premium = bool(data[0].get('is_premium', False))
-
-            return jsonify({
-                "status": "success",
-                "is_premium": is_premium
-            }), 200
-        else:
-            logging.error(f"Supabase check premium error: {response.text}")
-            return jsonify({"status": "error", "message": "Database error"}), 500
-
-    except Exception as e:
-        logging.error(f"Check premium error: {e}")
-        return jsonify({"status": "error", "message": "An internal server error occurred"}), 500
-
 def _alert_sb(path):
     return f"{os.getenv('SUPABASE_URL')}/rest/v1/{path}"
 
