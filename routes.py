@@ -2866,6 +2866,22 @@ def premium_status(user_id):
         return None
 
 
+def _premium_push(ref):
+    """Tell the phone its payment landed, so the app can refresh and celebrate.
+    Best effort: a failed push must never affect the payment itself."""
+    try:
+        o = requests.get(_alert_sb('premium_orders'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                         params={'reference': f'eq.{ref}', 'select': 'user_id'})
+        o.raise_for_status()
+        rows = o.json()
+        if rows and rows[0].get('user_id'):
+            _circle_push(rows[0]['user_id'], "You're Premium",
+                         'Your payment was received. Premium is now active.',
+                         {'type': 'premium_activated'})
+    except Exception as e:
+        logging.error(f"premium push failed for {ref}: {e}")
+
+
 def premium_settle(ref):
     """Confirm ONE payment with Korapay, then apply it exactly once.
     The webhook, the callback page and the offer poll all call this, in any order
@@ -2898,6 +2914,8 @@ def premium_settle(ref):
             a.raise_for_status()
             result = a.json().get('result', 'error')
             logging.info(f"premium order {ref}: {result}")
+            if result == 'paid':      # applied just now (not 'already'): tell the phone once
+                _premium_push(ref)
             return result
         if state == 'failed':
             requests.patch(_alert_sb('premium_orders'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
