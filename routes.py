@@ -2838,7 +2838,7 @@ def alerts_mark_read():
 # Every limit lives here. The premium page, /api/entitlements and the
 # enforcement all read this, so changing a number changes them all.
 PLAN_LIMITS = {
-    'free':    {'circle_max': 2,  'alerts_per_day': 6,  'max_video_secs': 30,
+    'free':    {'circle_max': 2,  'alerts_per_day': 3,  'max_video_secs': 30,
                 'can_download': False, 'can_use_map': False},
     'premium': {'circle_max': 10, 'alerts_per_day': 30, 'max_video_secs': 120,
                 'can_download': True,  'can_use_map': True},
