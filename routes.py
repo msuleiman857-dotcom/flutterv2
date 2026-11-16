@@ -2941,17 +2941,6 @@ def premium_offer():
              'detail': 'Download any video alert you receive.'},
         ])
 
-
-# ── what this user is allowed to do right now (the app caches this) ─────────
-@app.route('/api/entitlements', methods=['GET'])
-@jwt_required()
-def premium_entitlements():
-    st = premium_status(get_jwt_identity())
-    if st is None:
-        return _circle_bad('Could not load your plan right now.', 500)
-    return _circle_ok(is_premium=st['is_premium'], premium_until=st['premium_until'], **st['plan'])
-
-
 # ── Pay button: create the order, hand back Korapay's checkout link ─────────
 @app.route('/api/premium/checkout', methods=['POST'])
 @limiter.limit('10 per hour')
@@ -3067,3 +3056,64 @@ def check_premium_status(user_id):
 def is_premium_user(conn, user_id):
     st = premium_status(user_id)
     return bool(st and st['is_premium'])
+
+def circle_slots(user_id):
+    """Slots in use = accepted contacts (either direction) + requests I sent that
+    are still waiting. Requests I RECEIVED don't use a slot until I accept."""
+    res = _sb.get(_alert_sb('mutual_contacts'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                  params={'or': f'(sender.eq.{user_id},accepter.eq.{user_id})', 'select': 'sender,status'})
+    res.raise_for_status()
+    return sum(1 for r in res.json() if r['status'] or r['sender'] == user_id)
+
+
+def circle_full_error(user_id):
+    """None if this user has a free circle slot, else the 403 to return as-is."""
+    st = premium_status(user_id)
+    if st is None:
+        raise RuntimeError('premium lookup failed')      # fail closed: a 500, never a free pass
+    cap, used = st['plan']['circle_max'], circle_slots(user_id)
+    if used < cap:
+        return None
+    return _circle_bad(f'Your circle is full ({used}/{cap}).', 403, error_code='circle_full',
+                       limit=cap, used=used, is_premium=st['is_premium'])
+
+
+def alerts_today(user_id):
+    """The alert_keys this user fired since midnight Nigerian time (WAT, UTC+1)."""
+    midnight = datetime.now(timezone(timedelta(hours=1))).replace(hour=0, minute=0, second=0, microsecond=0)
+    res = _sb.get(_alert_sb('messages'), headers=_supabase_headers(), timeout=_SB_TIMEOUT,
+                  params={'sender_id': f'eq.{user_id}', 'alert_key': 'not.is.null',
+                          'sent_at': f'gte.{midnight.isoformat()}', 'select': 'alert_key', 'limit': '1000'})
+    res.raise_for_status()
+    return {r['alert_key'] for r in res.json()}
+
+
+def alert_limit_error(user_id, alert_key):
+    """None if this alert may go out, else the 403 to return as-is. Re-sending an
+    alert that already went out (an app retry) is never blocked or counted twice."""
+    st = premium_status(user_id)
+    if st is None:
+        raise RuntimeError('premium lookup failed')
+    sent, cap = alerts_today(user_id), st['plan']['alerts_per_day']
+    if alert_key in sent or len(sent) < cap:
+        return None
+    return _circle_bad(f"You've used all {cap} alerts for today.", 403, error_code='alert_limit',
+                       limit=cap, used=len(sent), is_premium=st['is_premium'])
+
+
+# Replaces the earlier premium_entitlements: same plan limits, plus today's usage
+# so the app can show "2/2 contacts" and "4/6 alerts" without guessing.
+@app.route('/api/entitlements', methods=['GET'])
+@jwt_required()
+def premium_entitlements():
+    me = get_jwt_identity()
+    try:
+        st = premium_status(me)
+        if st is None:
+            return _circle_bad('Could not load your plan right now.', 500)
+        return _circle_ok(is_premium=st['is_premium'], premium_until=st['premium_until'],
+                          circle_used=circle_slots(me), alerts_used_today=len(alerts_today(me)),
+                          **st['plan'])
+    except Exception as e:
+        logging.error(f"premium_entitlements error: {e}")
+        return _circle_bad('Server error.', 500)
