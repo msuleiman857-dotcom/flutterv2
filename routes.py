@@ -2196,7 +2196,6 @@ def circle_search():
         logging.error(f"circle_search error: {e}")
         return _circle_bad("Server error.", 500)
 
-
 @app.route('/api/circle/request', methods=['POST'])
 @limiter.limit("20 per hour")
 @jwt_required()
@@ -2225,6 +2224,9 @@ def circle_request():
             if existing['sender'] == me:
                 return _circle_ok(relation='pending_sent', link_id=existing['id'],
                                   message="Request already sent.")
+            full = circle_full_error(me)  # PLAN LIMIT
+            if full:
+                return full
             # They already asked you, so both want it: accept.
             requests.patch(
                 _alert_sb('mutual_contacts'), headers=_supabase_headers(),
@@ -2237,6 +2239,9 @@ def circle_request():
                          {'type': 'circle_accepted', 'user_id': me})
             return _circle_ok(relation='accepted', link_id=existing['id'])
 
+        full = circle_full_error(me)  # PLAN LIMIT
+        if full:
+            return full
         cnt = requests.get(
             _alert_sb('mutual_contacts'),
             headers={**_supabase_headers(), 'Prefer': 'count=exact'},
@@ -2272,7 +2277,6 @@ def circle_request():
     except Exception as e:
         logging.error(f"circle_request error: {e}")
         return _circle_bad("Server error.", 500)
-
 
 @app.route('/api/circle', methods=['GET'])
 @jwt_required()
@@ -2310,7 +2314,6 @@ def circle_list():
         logging.error(f"circle_list error: {e}")
         return _circle_bad("Server error.", 500)
 
-
 @app.route('/api/circle/respond', methods=['POST'])
 @limiter.limit("60 per hour")
 @jwt_required()
@@ -2329,6 +2332,9 @@ def circle_respond():
             return _circle_bad("Nothing to respond to.", 403)
 
         if accept:
+            full = circle_full_error(me)  # PLAN LIMIT
+            if full:
+                return full
             requests.patch(
                 _alert_sb('mutual_contacts'), headers=_supabase_headers(),
                 params={'id': f'eq.{link_id}', 'status': 'eq.false'},
@@ -2350,7 +2356,6 @@ def circle_respond():
     except Exception as e:
         logging.error(f"circle_respond error: {e}")
         return _circle_bad("Server error.", 500)
-
 
 @app.route('/api/circle/remove', methods=['POST'])
 @limiter.limit("60 per hour")
@@ -2521,7 +2526,6 @@ def _alert_push_all(sender_id, rows, lat, lng):
     except Exception as e:
         logging.error(f"alert push crashed: {e}")
 
-
 @app.route('/api/alert', methods=['POST'])
 @limiter.limit("30 per hour")
 @jwt_required()
@@ -2567,6 +2571,10 @@ def fire_alert():
     source = 'phone'
 
     try:
+        limit = alert_limit_error(me, alert_key)  # PLAN LIMIT
+        if limit:
+            return limit
+
         contacts = _alert_contact_ids(me)
         if not contacts:
             return _circle_ok(alert_key=alert_key, contacts=0)
@@ -2625,7 +2633,6 @@ def fire_alert():
     except Exception as e:
         logging.error(f"fire_alert error: {e}")
         return bad("Server error", 500)
-
 
 @app.route('/api/alert/attach-media', methods=['POST'])
 @limiter.limit("30 per hour")
